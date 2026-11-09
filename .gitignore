@@ -27,3 +27,8 @@ yarn-error.log*
 # OS
 .DS_Store
 Thumbs.db
+
+# Next.js 自动生成
+next-env.d.ts
+*.tsbuildinfo
+.vercel
