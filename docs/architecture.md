@@ -16,7 +16,7 @@
 - **长文 Agent**：根据提纲生成公众号风格长文（2000字+）。
 - **脚本 Agent**：根据提纲生成短视频脚本（分镜+台词）。
 - **小红书 Agent**：根据提纲生成小红书图文（标题+正文+标签）。
-- **配图 Agent**：根据提纲生成配图描述词（可接文生图 API）。
+- **配图 Agent**：分两步，先把提纲里的配图描述扩写成高质量出图提示词（流式可见），再把提示词交给 Seedream 生成真实图片。
 
 4 个内容 Agent 之间无依赖，并行执行；但它们都依赖策划 Agent 的输出，构成真实的上下游协同关系。
 
@@ -83,28 +83,45 @@
 - 最多自动重试 **1 次**，重试依然失败才判定策划节点 `failed`
 - 判定失败后，后置 4 个节点保持 `pending`，一律不启动
 
-**4. 失败状态推送**
+**4. SSE 事件协议**
 
-策划节点失败时，通过 SSE 推送节点状态事件：
+所有事件都按 `event: <名称>` + `data: <JSON>` 推送，完整清单：
+
+| 事件 | 时机 | data 结构 |
+|---|---|---|
+| `snapshot` | 连接建立时先推一次 | `{ status, nodes }`，nodes 含每个节点当前状态和已累积内容 |
+| `node:start` | 节点开始（策划自动重试会再发一次） | `{ nodeId, name, model, attempt }` |
+| `node:token` | 收到一个 token | `{ nodeId, text }` |
+| `node:image` | 配图出图成功 | `{ nodeId, url, prompt }` |
+| `node:done` | 节点完成 | `{ nodeId }` |
+| `node:error` | 节点失败 | `{ nodeId, message }` |
+| `node:cancelled` | 节点被中断 | `{ nodeId }` |
+| `run:done` | 整条流水线结束 | `{ summary }` |
+| `run:failed` | 策划失败导致流水线终止 | `{ message }` |
+
+策划节点失败时推送：
 
 ```
-event: node_status
-data: {"nodeId":"planner","status":"failed","reason":"JSON解析失败（已重试1次）"}
+event: node:error
+data: {"nodeId":"planner","message":"JSON 解析失败（已重试1次）"}
 ```
 
-前端 `AgentNode` 收到后节点变红展示失败，并提示「策划提纲生成失败，无法继续生成内容」。
+随后推送 `run:failed`，前端提示「策划提纲生成失败，无法继续生成内容」。
 
 ## 模型分工（差异化）
 
 不同平台使用擅长该文体的模型：
 
-| Agent | 推荐模型 | 原因 |
+| Agent | 实际模型 id | 原因 |
 |---|---|---|
-| 策划 Agent | DeepSeek | 结构化拆解能力强 |
-| 长文 Agent | DeepSeek / 通义 | 擅长长文逻辑结构 |
-| 脚本 Agent | DeepSeek | 擅长分镜格式输出 |
-| 小红书 Agent | 豆包 / Kimi | 网感好，擅长 emoji 和标签 |
-| 配图 Agent | 可灵 / 即梦 / SD | 文生图专用模型 |
+| 策划 Agent | `deepseek-v4-1-flash-261017` | 结构化拆解和 JSON 输出稳定 |
+| 长文 Agent | `deepseek-v4-1-flash-261017` | 擅长长文逻辑结构 |
+| 脚本 Agent | `deepseek-v4-1-flash-261017` | 擅长分镜格式输出 |
+| 小红书 Agent | `doubao-seed-2-1-pro-260915` | 中文网感好，擅长情绪表达和标签 |
+| 配图 Agent（扩写） | `doubao-seed-2-1-pro-260915` | 中文视觉描述能力强 |
+| 配图 Agent（出图） | `doubao-seedream-5-0-flash-260915` | 文生图专用，出图质量好 |
+
+所有模型共用同一个方舟 API Key，仅通过 `model_id` 切换，不需要对接多个服务商。
 
 ## 技术架构
 
@@ -119,8 +136,8 @@ data: {"nodeId":"planner","status":"failed","reason":"JSON解析失败（已重�
                        ▼
 ┌─────────────────────────────────────────────────────┐
 │ 后端 API (Next.js API Routes)                        │
-│ POST /api/run            启动流水线                    │
-│ POST /api/stop/:runId    中断全部                     │
+│ POST /api/run            启动流水线，返回 runId        │
+│ POST /api/stop/:runId    中断全部；?nodeId= 单节点中断 │
 │ POST /api/rerun/:nodeId  重跑单个节点                  │
 │ GET  /api/stream/:runId  SSE 推送状态+内容             │
 └──────────────────────┬──────────────────────────────┘
@@ -137,7 +154,7 @@ data: {"nodeId":"planner","status":"failed","reason":"JSON解析失败（已重�
 ┌─────────────────────────────────────────────────────┐
 │ Agent 层（共享基类，不同 prompt + 模型）               │
 │ base.ts → 通用调用逻辑、流式、AbortSignal              │
-│ planner.ts / longForm.ts / script.ts / xhs.ts / image.ts│
+│ planner.ts / longform.ts / script.ts / xhs.ts / image.ts│
 └─────────────────────────────────────────────────────┘
 ```
 
@@ -147,7 +164,7 @@ data: {"nodeId":"planner","status":"failed","reason":"JSON解析失败（已重�
 2. **SSE 而非 WebSocket**：只需要后端向前端单向推送状态和内容，SSE 足够且更简单。需处理断连重连和 Last-Event-ID。
 3. **React Flow 做看板**：节点状态用颜色区分（灰/蓝/绿/红），节点内展示内容预览，点击展开完整产出。
 4. **中断逻辑**：每个 Node 单独持有独立的 AbortController，不共用全局 signal；abort 只切断 LLM 流式请求，不清空 node.content。具体规则：
-   - **全局中断（策划阶段）**：策划节点停止生成，已输出内容保留；4 个后置节点未启动，不执行。
+   - **全局中断（策划阶段）**：策划节点停止生成，已输出内容保留并标记为 `cancelled`；4 个后置节点状态标记为 `cancelled`，不再启动。
    - **全局中断（并行阶段）**：策划节点已完成保持不动；已完成的节点内容保留不动；正在流式输出的节点立刻停止拉取新 token、已生成文字保留；还没启动的 pending 节点标记为 cancelled，不再启动。
    - **单节点中断**：仅指定节点停止生成、已有内容保留；策划及其他所有节点不受影响，正常跑、内容保留；其他 pending 节点继续正常调度执行。
 
@@ -160,9 +177,10 @@ data: {"nodeId":"planner","status":"failed","reason":"JSON解析失败（已重�
 | SSE Hook | hooks/useRunStream.ts | 连接流接口，更新状态 |
 | 启动接口 | app/api/run/route.ts | 创建 run，启动编排 |
 | 流接口 | app/api/stream/[runId]/route.ts | SSE 推送 |
-| 中断接口 | app/api/stop/[runId]/route.ts | 中断全部 |
+| 中断接口 | app/api/stop/[runId]/route.ts | 中断全部；带 nodeId 则只中断指定节点 |
 | 重跑接口 | app/api/rerun/[nodeId]/route.ts | 重跑单节点 |
 | 编排引擎 | lib/orchestrator.ts | 状态机、并行调度、中断/重跑 |
 | Agent 基类 | lib/agents/base.ts | 模型调用、流式、AbortSignal |
 | 各 Agent | lib/agents/*.ts | 各自 prompt + 模型配置 |
 | 模型封装 | lib/llm.ts | 统一 API 调用 |
+| 图像封装 | lib/image.ts | 文生图接口调用（Seedream） |
