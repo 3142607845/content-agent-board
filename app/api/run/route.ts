@@ -1,10 +1,10 @@
-import { PlannerAgent } from "@/lib/agents/planner";
+import { createRun, startRun } from "@/lib/orchestrator";
 
 /**
  * POST /api/run
  *
- * 阶段 1 只跑策划 Agent：收选题，流式返回提纲 JSON。
- * 阶段 2 会拆成「启动 run」和「订阅 stream/:runId」两个接口。
+ * 只负责创建运行并立即返回 runId，真正的编排在后台异步跑。
+ * 前端拿到 runId 后去连 /api/stream/[runId] 看实时状态。
  */
 export async function POST(req: Request) {
   let topic = "";
@@ -19,62 +19,8 @@ export async function POST(req: Request) {
     return Response.json({ error: "缺少选题 topic" }, { status: 400 });
   }
 
-  const planner = new PlannerAgent();
-  const encoder = new TextEncoder();
+  const run = createRun(topic);
+  startRun(run.id);
 
-  const stream = new ReadableStream<Uint8Array>({
-    async start(controller) {
-      let closed = false;
-
-      const send = (event: string, data: unknown) => {
-        if (closed) return;
-        try {
-          controller.enqueue(
-            encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`),
-          );
-        } catch {
-          // 前端已断开，忽略后续写入
-          closed = true;
-        }
-      };
-
-      try {
-        send("start", { nodeId: planner.id, model: planner.modelId });
-
-        await planner.run(topic, {
-          signal: req.signal,
-          onToken: (text) => send("token", { text }),
-        });
-
-        send("done", { nodeId: planner.id });
-      } catch (err) {
-        if (err instanceof Error && err.name === "AbortError") {
-          send("aborted", { nodeId: planner.id });
-        } else {
-          send("error", {
-            nodeId: planner.id,
-            message: err instanceof Error ? err.message : String(err),
-          });
-        }
-      } finally {
-        if (!closed) {
-          closed = true;
-          try {
-            controller.close();
-          } catch {
-            // 已关闭则忽略
-          }
-        }
-      }
-    },
-  });
-
-  return new Response(stream, {
-    headers: {
-      "Content-Type": "text/event-stream; charset=utf-8",
-      "Cache-Control": "no-cache, no-transform",
-      Connection: "keep-alive",
-      "X-Accel-Buffering": "no",
-    },
-  });
+  return Response.json({ runId: run.id });
 }
