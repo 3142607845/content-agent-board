@@ -8,19 +8,14 @@ import type {
   RunStatus,
 } from "@/lib/orchestrator";
 
-/**
- * 阶段 2 简易看板：5 个 Agent 分区平铺，先跑通状态流转、中断和重跑。
- * 阶段 3 会换成 React Flow 画布。
- */
-
 const NODE_ORDER: NodeId[] = ["planner", "longform", "script", "xhs", "image"];
 
-const NODE_META: Record<NodeId, { desc: string }> = {
-  planner: { desc: "拆解选题，产出四渠道提纲 JSON" },
-  longform: { desc: "公众号长文，2000 字以上" },
-  script: { desc: "短视频分镜脚本" },
-  xhs: { desc: "小红书笔记正文与标签" },
-  image: { desc: "扩写提示词并调用 Seedream 出图" },
+const NODE_META: Record<NodeId, { name: string; desc: string }> = {
+  planner: { name: "策划 Agent", desc: "拆解选题，产出四渠道提纲 JSON" },
+  longform: { name: "公众号长文", desc: "公众号长文，2000 字以上" },
+  script: { name: "短视频脚本", desc: "短视频分镜脚本" },
+  xhs: { name: "小红书笔记", desc: "小红书笔记正文与标签" },
+  image: { name: "配图 Agent", desc: "扩写提示词并调用 Seedream 出图" },
 };
 
 const STATUS_STYLE: Record<
@@ -61,12 +56,29 @@ const RUN_STATUS_TEXT: Record<RunStatus, string> = {
   aborted: "已中断",
 };
 
+type Mode = "single" | "multi-topic" | "multi-version";
+
+const MODE_TABS: { id: Mode; label: string }[] = [
+  { id: "single", label: "单次生成模式" },
+  { id: "multi-topic", label: "批量选题模式" },
+  { id: "multi-version", label: "多版生成模式" },
+];
+
+interface TaskResult {
+  id: string;
+  topic: string;
+  label: string;
+  status: "pending" | "running" | "completed" | "failed" | "aborted";
+  nodes: Record<NodeId, AgentNodeState>;
+  runId?: string;
+}
+
 function emptyNodes(): Record<NodeId, AgentNodeState> {
   const nodes = {} as Record<NodeId, AgentNodeState>;
   for (const id of NODE_ORDER) {
     nodes[id] = {
       id,
-      name: "",
+      name: NODE_META[id].name,
       status: "pending",
       content: "",
       attempt: 0,
@@ -76,119 +88,268 @@ function emptyNodes(): Record<NodeId, AgentNodeState> {
 }
 
 export default function Home() {
+  const [mode, setMode] = useState<Mode>("single");
   const [topic, setTopic] = useState("");
+  const [multiTopic, setMultiTopic] = useState("");
+  const [versionCount, setVersionCount] = useState(3);
+
+  // 单次模式状态
   const [nodes, setNodes] = useState<Record<NodeId, AgentNodeState>>(emptyNodes);
   const [runStatus, setRunStatus] = useState<RunStatus | "idle">("idle");
   const [runId, setRunId] = useState<string | null>(null);
+
+  // 批量模式状态
+  const [tasks, setTasks] = useState<TaskResult[]>([]);
+  const [activeTaskIndex, setActiveTaskIndex] = useState(0);
+
   const [notice, setNotice] = useState("");
   const [copied, setCopied] = useState<Partial<Record<NodeId, boolean>>>({});
   const esRef = useRef<EventSource | null>(null);
+  const batchRunningRef = useRef(false);
 
-  // 卸载时关闭 SSE
-  useEffect(() => () => esRef.current?.close(), []);
-
-  const patchNode = useCallback(
-    (nodeId: NodeId, patch: Partial<AgentNodeState>) => {
-      setNodes((prev) => ({ ...prev, [nodeId]: { ...prev[nodeId], ...patch } }));
+  useEffect(
+    () => () => {
+      esRef.current?.close();
+      batchRunningRef.current = false;
     },
     [],
   );
 
-  const connect = useCallback((id: string) => {
-    esRef.current?.close();
+  // 当前展示的数据源
+  const currentNodes =
+    mode === "single" ? nodes : tasks[activeTaskIndex]?.nodes ?? emptyNodes();
+  const currentRunId =
+    mode === "single" ? runId : tasks[activeTaskIndex]?.runId ?? null;
+  const currentTaskStatus =
+    mode === "single" ? runStatus : tasks[activeTaskIndex]?.status ?? "idle";
+  const currentTopic =
+    mode === "single" ? topic : tasks[activeTaskIndex]?.topic ?? topic;
+  const isRunning = currentTaskStatus === "running";
+  const isCompleted = currentTaskStatus === "completed";
 
-    const es = new EventSource(`/api/stream/${id}`);
-    esRef.current = es;
-
-    es.addEventListener("snapshot", (ev) => {
-      const data = JSON.parse((ev as MessageEvent).data) as {
-        status: RunStatus;
-        nodes: Record<NodeId, AgentNodeState>;
-      };
-      setNodes(data.nodes);
-      setRunStatus(data.status);
-    });
-
-    // 收到 start 就清空该节点文本，策划自动重试时会带上 attempt=2
-    es.addEventListener("node:start", (ev) => {
-      const d = JSON.parse((ev as MessageEvent).data) as {
-        nodeId: NodeId;
-        attempt: number;
-      };
-      patchNode(d.nodeId, {
-        status: "running",
-        content: "",
-        imageUrl: undefined,
-        error: undefined,
-        attempt: d.attempt,
-      });
-    });
-
-    es.addEventListener("node:token", (ev) => {
-      const d = JSON.parse((ev as MessageEvent).data) as {
-        nodeId: NodeId;
-        text: string;
-      };
+  const patchNodeSingle = useCallback(
+    (nodeId: NodeId, patch: Partial<AgentNodeState>) => {
       setNodes((prev) => ({
         ...prev,
-        [d.nodeId]: {
-          ...prev[d.nodeId],
-          content: prev[d.nodeId].content + d.text,
-        },
+        [nodeId]: { ...prev[nodeId], ...patch },
       }));
+    },
+    [],
+  );
+
+  const patchNodeTask = useCallback(
+    (taskIndex: number, nodeId: NodeId, patch: Partial<AgentNodeState>) => {
+      setTasks((prev) =>
+        prev.map((t, idx) =>
+          idx === taskIndex
+            ? { ...t, nodes: { ...t.nodes, [nodeId]: { ...t.nodes[nodeId], ...patch } } }
+            : t,
+        ),
+      );
+    },
+    [],
+  );
+
+  // 单次模式 SSE
+  const connectSingle = useCallback(
+    (id: string) => {
+      esRef.current?.close();
+      const es = new EventSource(`/api/stream/${id}`);
+      esRef.current = es;
+
+      es.addEventListener("snapshot", (ev) => {
+        const data = JSON.parse((ev as MessageEvent).data) as {
+          status: RunStatus;
+          nodes: Record<NodeId, AgentNodeState>;
+        };
+        setNodes(data.nodes);
+        setRunStatus(data.status);
+      });
+
+      es.addEventListener("node:start", (ev) => {
+        const d = JSON.parse((ev as MessageEvent).data) as {
+          nodeId: NodeId;
+          attempt: number;
+        };
+        patchNodeSingle(d.nodeId, {
+          status: "running",
+          content: "",
+          imageUrl: undefined,
+          error: undefined,
+          attempt: d.attempt,
+        });
+      });
+
+      es.addEventListener("node:token", (ev) => {
+        const d = JSON.parse((ev as MessageEvent).data) as {
+          nodeId: NodeId;
+          text: string;
+        };
+        setNodes((prev) => ({
+          ...prev,
+          [d.nodeId]: {
+            ...prev[d.nodeId],
+            content: prev[d.nodeId].content + d.text,
+          },
+        }));
+      });
+
+      es.addEventListener("node:image", (ev) => {
+        const d = JSON.parse((ev as MessageEvent).data) as {
+          nodeId: NodeId;
+          url: string;
+        };
+        patchNodeSingle(d.nodeId, { imageUrl: d.url });
+      });
+
+      es.addEventListener("node:done", (ev) => {
+        const d = JSON.parse((ev as MessageEvent).data) as { nodeId: NodeId };
+        patchNodeSingle(d.nodeId, { status: "completed" });
+      });
+
+      es.addEventListener("node:error", (ev) => {
+        const d = JSON.parse((ev as MessageEvent).data) as {
+          nodeId: NodeId;
+          message: string;
+        };
+        patchNodeSingle(d.nodeId, { status: "failed", error: d.message });
+      });
+
+      es.addEventListener("node:cancelled", (ev) => {
+        const d = JSON.parse((ev as MessageEvent).data) as { nodeId: NodeId };
+        patchNodeSingle(d.nodeId, { status: "cancelled" });
+      });
+
+      es.addEventListener("run:done", () => {
+        setRunStatus((prev) => (prev === "aborted" ? prev : "completed"));
+      });
+
+      es.addEventListener("run:failed", (ev) => {
+        const d = JSON.parse((ev as MessageEvent).data) as { message: string };
+        setRunStatus("failed");
+        setNotice(d.message);
+      });
+
+      es.onerror = () => {};
+    },
+    [patchNodeSingle],
+  );
+
+  // 批量模式 SSE，返回 Promise 在 run 结束时 resolve
+  function connectTask(runId: string, taskIndex: number): Promise<void> {
+    return new Promise((resolve) => {
+      esRef.current?.close();
+      const es = new EventSource(`/api/stream/${runId}`);
+      esRef.current = es;
+
+      es.addEventListener("snapshot", (ev) => {
+        const data = JSON.parse((ev as MessageEvent).data) as {
+          status: RunStatus;
+          nodes: Record<NodeId, AgentNodeState>;
+        };
+        setTasks((prev) =>
+          prev.map((t, idx) =>
+            idx === taskIndex ? { ...t, nodes: data.nodes, status: data.status } : t,
+          ),
+        );
+      });
+
+      es.addEventListener("node:start", (ev) => {
+        const d = JSON.parse((ev as MessageEvent).data) as {
+          nodeId: NodeId;
+          attempt: number;
+        };
+        patchNodeTask(taskIndex, d.nodeId, {
+          status: "running",
+          content: "",
+          imageUrl: undefined,
+          error: undefined,
+          attempt: d.attempt,
+        });
+      });
+
+      es.addEventListener("node:token", (ev) => {
+        const d = JSON.parse((ev as MessageEvent).data) as {
+          nodeId: NodeId;
+          text: string;
+        };
+        setTasks((prev) =>
+          prev.map((t, idx) =>
+            idx === taskIndex
+              ? {
+                  ...t,
+                  nodes: {
+                    ...t.nodes,
+                    [d.nodeId]: {
+                      ...t.nodes[d.nodeId],
+                      content: t.nodes[d.nodeId].content + d.text,
+                    },
+                  },
+                }
+              : t,
+          ),
+        );
+      });
+
+      es.addEventListener("node:image", (ev) => {
+        const d = JSON.parse((ev as MessageEvent).data) as {
+          nodeId: NodeId;
+          url: string;
+        };
+        patchNodeTask(taskIndex, d.nodeId, { imageUrl: d.url });
+      });
+
+      es.addEventListener("node:done", (ev) => {
+        const d = JSON.parse((ev as MessageEvent).data) as { nodeId: NodeId };
+        patchNodeTask(taskIndex, d.nodeId, { status: "completed" });
+      });
+
+      es.addEventListener("node:error", (ev) => {
+        const d = JSON.parse((ev as MessageEvent).data) as {
+          nodeId: NodeId;
+          message: string;
+        };
+        patchNodeTask(taskIndex, d.nodeId, { status: "failed", error: d.message });
+      });
+
+      es.addEventListener("node:cancelled", (ev) => {
+        const d = JSON.parse((ev as MessageEvent).data) as { nodeId: NodeId };
+        patchNodeTask(taskIndex, d.nodeId, { status: "cancelled" });
+      });
+
+      es.addEventListener("run:done", () => {
+        setTasks((prev) =>
+          prev.map((t, idx) =>
+            idx === taskIndex ? { ...t, status: "completed" } : t,
+          ),
+        );
+        resolve();
+      });
+
+      es.addEventListener("run:failed", (ev) => {
+        const d = JSON.parse((ev as MessageEvent).data) as { message: string };
+        setTasks((prev) =>
+          prev.map((t, idx) =>
+            idx === taskIndex ? { ...t, status: "failed" } : t,
+          ),
+        );
+        setNotice(d.message);
+        resolve();
+      });
+
+      es.onerror = () => {};
     });
+  }
 
-    es.addEventListener("node:image", (ev) => {
-      const d = JSON.parse((ev as MessageEvent).data) as {
-        nodeId: NodeId;
-        url: string;
-      };
-      patchNode(d.nodeId, { imageUrl: d.url });
-    });
-
-    es.addEventListener("node:done", (ev) => {
-      const d = JSON.parse((ev as MessageEvent).data) as { nodeId: NodeId };
-      patchNode(d.nodeId, { status: "completed" });
-    });
-
-    es.addEventListener("node:error", (ev) => {
-      const d = JSON.parse((ev as MessageEvent).data) as {
-        nodeId: NodeId;
-        message: string;
-      };
-      patchNode(d.nodeId, { status: "failed", error: d.message });
-    });
-
-    es.addEventListener("node:cancelled", (ev) => {
-      const d = JSON.parse((ev as MessageEvent).data) as { nodeId: NodeId };
-      patchNode(d.nodeId, { status: "cancelled" });
-    });
-
-    es.addEventListener("run:done", () => {
-      setRunStatus((prev) => (prev === "aborted" ? prev : "completed"));
-    });
-
-    es.addEventListener("run:failed", (ev) => {
-      const d = JSON.parse((ev as MessageEvent).data) as { message: string };
-      setRunStatus("failed");
-      setNotice(d.message);
-    });
-
-    es.onerror = () => {
-      // EventSource 会自动重连，重连后服务端会重发 snapshot
-    };
-  }, [patchNode]);
-
-  async function handleStart() {
+  // 单次：开始
+  async function handleStartSingle() {
     const value = topic.trim();
     if (!value) return;
-
     esRef.current?.close();
     setNodes(emptyNodes());
     setRunStatus("running");
     setNotice("");
     setCopied({});
-
     try {
       const res = await fetch("/api/run", {
         method: "POST",
@@ -196,51 +357,138 @@ export default function Home() {
         body: JSON.stringify({ topic: value }),
       });
       const data = (await res.json()) as { runId?: string; error?: string };
-      if (!res.ok || !data.runId) {
-        throw new Error(data.error ?? `启动失败 ${res.status}`);
-      }
+      if (!res.ok || !data.runId) throw new Error(data.error ?? `启动失败 ${res.status}`);
       setRunId(data.runId);
-      connect(data.runId);
+      connectSingle(data.runId);
     } catch (err) {
       setRunStatus("failed");
       setNotice(err instanceof Error ? err.message : String(err));
     }
   }
 
-  async function handleStopAll() {
-    if (!runId) return;
-    await fetch(`/api/stop/${runId}`, { method: "POST" });
-    setRunStatus("aborted");
+  // 批量：开始
+  async function handleStartBatch() {
+    let taskList: { topic: string; label: string }[] = [];
+    if (mode === "multi-topic") {
+      const topics = multiTopic
+        .split("\n")
+        .map((t) => t.trim())
+        .filter(Boolean)
+        .slice(0, 3);
+      if (topics.length === 0) return;
+      taskList = topics.map((t, i) => ({ topic: t, label: `选题 ${i + 1}` }));
+    } else {
+      const t = topic.trim();
+      if (!t) return;
+      taskList = Array.from({ length: versionCount }, (_, i) => ({
+        topic: t,
+        label: `版本 ${i + 1}`,
+      }));
+    }
+
+    const initial: TaskResult[] = taskList.map((t, i) => ({
+      id: `${Date.now()}-${i}`,
+      topic: t.topic,
+      label: t.label,
+      status: "pending",
+      nodes: emptyNodes(),
+    }));
+
+    setTasks(initial);
+    setActiveTaskIndex(0);
+    setNotice("");
+    setCopied({});
+    batchRunningRef.current = true;
+
+    for (let i = 0; i < initial.length; i++) {
+      if (!batchRunningRef.current) {
+        setTasks((prev) =>
+          prev.map((t, idx) => (idx >= i ? { ...t, status: "aborted" } : t)),
+        );
+        break;
+      }
+      setActiveTaskIndex(i);
+      setTasks((prev) =>
+        prev.map((t, idx) => (idx === i ? { ...t, status: "running" } : t)),
+      );
+      try {
+        const res = await fetch("/api/run", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ topic: initial[i].topic }),
+        });
+        const data = (await res.json()) as { runId?: string; error?: string };
+        if (!res.ok || !data.runId) throw new Error(data.error ?? `启动失败 ${res.status}`);
+        setTasks((prev) =>
+          prev.map((t, idx) => (idx === i ? { ...t, runId: data.runId } : t)),
+        );
+        await connectTask(data.runId, i);
+      } catch (err) {
+        setTasks((prev) =>
+          prev.map((t, idx) => (idx === i ? { ...t, status: "failed" } : t)),
+        );
+        setNotice(err instanceof Error ? err.message : String(err));
+      }
+    }
+    batchRunningRef.current = false;
+  }
+
+  function handleStopAll() {
+    if (mode === "single") {
+      if (!runId) return;
+      fetch(`/api/stop/${runId}`, { method: "POST" });
+      setRunStatus("aborted");
+    } else {
+      batchRunningRef.current = false;
+      esRef.current?.close();
+      setTasks((prev) =>
+        prev.map((t) =>
+          t.status === "running" || t.status === "pending"
+            ? { ...t, status: "aborted" }
+            : t,
+        ),
+      );
+    }
   }
 
   async function handleStopNode(nodeId: NodeId) {
-    if (!runId) return;
-    await fetch(`/api/stop/${runId}?nodeId=${nodeId}`, { method: "POST" });
+    if (!currentRunId) return;
+    await fetch(`/api/stop/${currentRunId}?nodeId=${nodeId}`, { method: "POST" });
   }
 
   async function handleRerun(nodeId: NodeId) {
-    if (!runId) return;
+    if (!currentRunId) return;
     setNotice("");
     const res = await fetch(`/api/rerun/${nodeId}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ runId }),
+      body: JSON.stringify({ runId: currentRunId }),
     });
     if (!res.ok) {
       const data = (await res.json().catch(() => ({}))) as { error?: string };
       setNotice(data.error ?? `重跑失败 ${res.status}`);
       return;
     }
-    setRunStatus("running");
     setCopied((prev) => {
       const next = { ...prev };
       delete next[nodeId];
       return next;
     });
+    // 重跑后重新连接 SSE
+    if (mode === "single") {
+      setRunStatus("running");
+      connectSingle(currentRunId);
+    } else {
+      const idx = activeTaskIndex;
+      setTasks((prev) =>
+        prev.map((t, i) => (i === idx ? { ...t, status: "running" } : t)),
+      );
+      connectTask(currentRunId, idx);
+    }
   }
 
   async function handleCopy(nodeId: NodeId) {
-    const text = nodes[nodeId].content;
+    const text = currentNodes[nodeId].content;
     if (!text || copied[nodeId]) return;
     try {
       await navigator.clipboard.writeText(text);
@@ -251,34 +499,42 @@ export default function Home() {
   }
 
   function handleDownloadImage() {
-    const url = nodes.image.imageUrl;
+    const url = currentNodes.image.imageUrl;
     if (!url) return;
     const a = document.createElement("a");
     a.href = url;
-    a.download = `${topic || "image"}.png`;
+    a.download = `${currentTopic || "image"}.png`;
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
   }
 
   function handleExportAll() {
-    const lf = nodes.longform.content;
-    const sc = nodes.script.content;
-    const xhs = nodes.xhs.content;
-    const img = nodes.image.imageUrl || "";
-    const md = `# 选题：${topic}\n\n## 公众号长文\n\n${lf}\n\n## 短视频脚本\n\n${sc}\n\n## 小红书笔记\n\n${xhs}\n\n## 配图\n\n![配图](${img})\n`;
+    const lf = currentNodes.longform.content;
+    const sc = currentNodes.script.content;
+    const xhs = currentNodes.xhs.content;
+    const img = currentNodes.image.imageUrl || "";
+    const md = `# 选题：${currentTopic}\n\n## 公众号长文\n\n${lf}\n\n## 短视频脚本\n\n${sc}\n\n## 小红书笔记\n\n${xhs}\n\n## 配图\n\n![配图](${img})\n`;
     const blob = new Blob([md], { type: "text/markdown;charset=utf-8" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
-    a.download = `${topic || "content"}.md`;
+    a.download = `${currentTopic || "content"}.md`;
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
     URL.revokeObjectURL(url);
   }
 
-  const running = runStatus === "running";
+  function switchMode(next: Mode) {
+    if (isRunning) return;
+    setMode(next);
+    setNotice("");
+    setTasks([]);
+    setActiveTaskIndex(0);
+  }
+
+  const showBatchInput = mode === "multi-topic" || mode === "multi-version";
 
   return (
     <main className="mx-auto flex w-full max-w-6xl flex-1 flex-col gap-6 px-6 py-10">
@@ -289,69 +545,198 @@ export default function Home() {
         </p>
       </header>
 
-      <div className="flex flex-col gap-3 sm:flex-row">
-        <input
-          value={topic}
-          onChange={(e) => setTopic(e.target.value)}
-          onKeyDown={(e) => {
-            if (e.key === "Enter" && !running) handleStart();
-          }}
-          placeholder="输入一个选题，例如：AI 编程会不会取代程序员"
-          className="flex-1 rounded-lg border border-neutral-300 bg-white px-4 py-2.5 text-sm outline-none focus:border-neutral-500"
-        />
-        <button
-          onClick={handleStart}
-          disabled={running || !topic.trim()}
-          className="rounded-lg bg-neutral-900 px-5 py-2.5 text-sm font-medium text-white disabled:opacity-40"
-        >
-          {running ? "运行中…" : "开始生成"}
-        </button>
-        <button
-          onClick={handleStopAll}
-          disabled={!running}
-          className="rounded-lg border border-neutral-300 px-5 py-2.5 text-sm font-medium disabled:opacity-40"
-        >
-          全部中断
-        </button>
-        <button
-          onClick={handleExportAll}
-          disabled={runStatus !== "completed"}
-          className="rounded-lg bg-emerald-600 px-5 py-2.5 text-sm font-medium text-white disabled:opacity-40"
-        >
-          导出全部
-        </button>
+      {/* 模式切换 */}
+      <div className="flex gap-1 rounded-lg bg-neutral-100 p-1">
+        {MODE_TABS.map((tab) => (
+          <button
+            key={tab.id}
+            onClick={() => switchMode(tab.id)}
+            disabled={isRunning}
+            className={`flex-1 rounded-md px-4 py-2 text-sm font-medium transition disabled:opacity-40 ${
+              mode === tab.id
+                ? "bg-white text-neutral-900 shadow-sm"
+                : "text-neutral-500 hover:text-neutral-700"
+            }`}
+          >
+            {tab.label}
+          </button>
+        ))}
       </div>
 
+      {/* 输入区 */}
+      {mode === "single" && (
+        <div className="flex flex-col gap-3 sm:flex-row">
+          <input
+            value={topic}
+            onChange={(e) => setTopic(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" && !isRunning) handleStartSingle();
+            }}
+            placeholder="输入一个选题，例如：AI 编程会不会取代程序员"
+            className="flex-1 rounded-lg border border-neutral-300 bg-white px-4 py-2.5 text-sm outline-none focus:border-neutral-500"
+          />
+          <button
+            onClick={handleStartSingle}
+            disabled={isRunning || !topic.trim()}
+            className="rounded-lg bg-neutral-900 px-5 py-2.5 text-sm font-medium text-white disabled:opacity-40"
+          >
+            {isRunning ? "运行中…" : "开始生成"}
+          </button>
+          <button
+            onClick={handleStopAll}
+            disabled={!isRunning}
+            className="rounded-lg border border-neutral-300 px-5 py-2.5 text-sm font-medium disabled:opacity-40"
+          >
+            全部中断
+          </button>
+          <button
+            onClick={handleExportAll}
+            disabled={!isCompleted}
+            className="rounded-lg bg-emerald-600 px-5 py-2.5 text-sm font-medium text-white disabled:opacity-40"
+          >
+            导出全部
+          </button>
+        </div>
+      )}
+
+      {showBatchInput && (
+        <div className="flex flex-col gap-3">
+          {mode === "multi-topic" ? (
+            <textarea
+              value={multiTopic}
+              onChange={(e) => setMultiTopic(e.target.value)}
+              placeholder={"每行一个选题，最多 3 个，例如：\nAI 编程会不会取代程序员\n远程办公的利与弊\n如何培养专注力"}
+              rows={4}
+              className="w-full rounded-lg border border-neutral-300 bg-white px-4 py-3 text-sm outline-none focus:border-neutral-500"
+            />
+          ) : (
+            <div className="flex flex-col gap-3 sm:flex-row">
+              <input
+                value={topic}
+                onChange={(e) => setTopic(e.target.value)}
+                placeholder="输入一个选题"
+                className="flex-1 rounded-lg border border-neutral-300 bg-white px-4 py-2.5 text-sm outline-none focus:border-neutral-500"
+              />
+              <div className="flex items-center gap-2">
+                <span className="text-sm text-neutral-500">版本数</span>
+                <select
+                  value={versionCount}
+                  onChange={(e) => {
+                    setVersionCount(Number(e.target.value));
+                    setTasks([]);
+                    setActiveTaskIndex(0);
+                  }}
+                  disabled={isRunning}
+                  className="rounded-lg border border-neutral-300 bg-white px-3 py-2.5 text-sm disabled:opacity-40"
+                >
+                  {[2, 3, 4].map((n) => (
+                    <option key={n} value={n}>
+                      {n}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            </div>
+          )}
+          <div className="flex gap-3">
+            <button
+              onClick={handleStartBatch}
+              disabled={
+                isRunning ||
+                (mode === "multi-topic"
+                  ? !multiTopic.trim()
+                  : !topic.trim())
+              }
+              className="rounded-lg bg-neutral-900 px-5 py-2.5 text-sm font-medium text-white disabled:opacity-40"
+            >
+              {isRunning ? "运行中…" : "开始批量生成"}
+            </button>
+            <button
+              onClick={handleStopAll}
+              disabled={!isRunning}
+              className="rounded-lg border border-neutral-300 px-5 py-2.5 text-sm font-medium disabled:opacity-40"
+            >
+              全部中断
+            </button>
+            <button
+              onClick={handleExportAll}
+              disabled={!isCompleted}
+              className="rounded-lg bg-emerald-600 px-5 py-2.5 text-sm font-medium text-white disabled:opacity-40"
+            >
+              导出当前套
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* 状态栏 */}
       <div className="flex flex-wrap items-center gap-3 text-sm">
         <span className="text-neutral-500">流水线状态</span>
         <span
           className={
-            runStatus === "failed"
+            currentTaskStatus === "failed"
               ? "font-medium text-red-600"
-              : runStatus === "completed"
+              : currentTaskStatus === "completed"
                 ? "font-medium text-green-600"
-                : runStatus === "aborted"
+                : currentTaskStatus === "aborted"
                   ? "font-medium text-amber-600"
                   : "font-medium"
           }
         >
-          {runStatus === "idle" ? "未开始" : RUN_STATUS_TEXT[runStatus]}
+          {currentTaskStatus === "idle"
+            ? "未开始"
+            : currentTaskStatus in RUN_STATUS_TEXT
+              ? RUN_STATUS_TEXT[currentTaskStatus as RunStatus]
+              : currentTaskStatus}
         </span>
-        {runId && (
-          <span className="text-xs text-neutral-400">runId: {runId.slice(0, 8)}</span>
+        {currentRunId && (
+          <span className="text-xs text-neutral-400">runId: {currentRunId.slice(0, 8)}</span>
         )}
         {notice && <span className="text-red-600">{notice}</span>}
       </div>
 
+      {/* 批量模式 tabs */}
+      {mode !== "single" && tasks.length > 0 && (
+        <div className="flex flex-wrap gap-2">
+          {tasks.map((t, idx) => (
+            <button
+              key={t.id}
+              onClick={() => setActiveTaskIndex(idx)}
+              className={`flex items-center gap-2 rounded-lg border px-3 py-1.5 text-xs ${
+                idx === activeTaskIndex
+                  ? "border-neutral-900 bg-neutral-900 text-white"
+                  : "border-neutral-200 bg-white text-neutral-600"
+              }`}
+            >
+              <span
+                className={`h-2 w-2 rounded-full ${
+                  t.status === "completed"
+                    ? "bg-green-500"
+                    : t.status === "running"
+                      ? "bg-blue-500 animate-pulse"
+                      : t.status === "failed"
+                        ? "bg-red-500"
+                        : t.status === "aborted"
+                          ? "bg-amber-500"
+                          : "bg-neutral-300"
+                }`}
+              />
+              {t.label}
+            </button>
+          ))}
+        </div>
+      )}
+
+      {/* 卡片区 */}
       <div className="grid grid-cols-1 gap-4 md:grid-cols-4">
         {NODE_ORDER.map((nodeId) => {
-          const node = nodes[nodeId];
+          const node = currentNodes[nodeId];
           const style = STATUS_STYLE[node.status];
           const isPlanner = nodeId === "planner";
           const canStop = node.status === "running" || node.status === "pending";
           const canRerun =
             !isPlanner &&
-            nodes.planner.status === "completed" &&
+            currentNodes.planner.status === "completed" &&
             (node.status === "failed" ||
               node.status === "cancelled" ||
               node.status === "completed");
@@ -366,7 +751,7 @@ export default function Home() {
               <div className="flex items-start justify-between gap-2">
                 <div className="flex items-center gap-2">
                   <span className={`h-2 w-2 rounded-full ${style.dot}`} />
-                  <h2 className="text-sm font-semibold">{node.name || nodeId}</h2>
+                  <h2 className="text-sm font-semibold">{NODE_META[nodeId].name}</h2>
                 </div>
                 <span className="rounded-full bg-white/70 px-2 py-0.5 text-xs text-neutral-600">
                   {style.label}
@@ -379,7 +764,7 @@ export default function Home() {
               <div className="flex gap-2">
                 <button
                   onClick={() => handleStopNode(nodeId)}
-                  disabled={!running || !canStop}
+                  disabled={!isRunning || !canStop}
                   className="rounded-md border border-neutral-300 bg-white px-2.5 py-1 text-xs disabled:opacity-40"
                 >
                   中断
