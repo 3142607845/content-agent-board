@@ -106,6 +106,8 @@ export default function Home() {
 
   const [notice, setNotice] = useState("");
   const [copied, setCopied] = useState<Partial<Record<NodeId, boolean>>>({});
+  /** 卡片展开态；默认折叠，节点开始运行时自动展开 */
+  const [expanded, setExpanded] = useState<Partial<Record<NodeId, boolean>>>({});
   const esRef = useRef<EventSource | null>(null);
   const batchRunningRef = useRef(false);
 
@@ -138,6 +140,15 @@ export default function Home() {
     },
     [],
   );
+
+  const toggleNode = useCallback((nodeId: NodeId) => {
+    setExpanded((prev) => ({ ...prev, [nodeId]: !prev[nodeId] }));
+  }, []);
+
+  /** 节点开始运行时自动展开，让流式输出始终可见 */
+  const expandNode = useCallback((nodeId: NodeId) => {
+    setExpanded((prev) => (prev[nodeId] ? prev : { ...prev, [nodeId]: true }));
+  }, []);
 
   const patchNodeTask = useCallback(
     (taskIndex: number, nodeId: NodeId, patch: Partial<AgentNodeState>) => {
@@ -180,6 +191,7 @@ export default function Home() {
           error: undefined,
           attempt: d.attempt,
         });
+        expandNode(d.nodeId);
       });
 
       es.addEventListener("node:token", (ev) => {
@@ -234,7 +246,7 @@ export default function Home() {
 
       es.onerror = () => {};
     },
-    [patchNodeSingle],
+    [patchNodeSingle, expandNode],
   );
 
   // 批量模式 SSE，返回 Promise 在 run 结束时 resolve
@@ -268,6 +280,7 @@ export default function Home() {
           error: undefined,
           attempt: d.attempt,
         });
+        expandNode(d.nodeId);
       });
 
       es.addEventListener("node:token", (ev) => {
@@ -352,6 +365,7 @@ export default function Home() {
     setRunStatus("running");
     setNotice("");
     setCopied({});
+    setExpanded({});
     try {
       const res = await fetch("/api/run", {
         method: "POST",
@@ -403,6 +417,7 @@ export default function Home() {
     setActiveTaskIndex(0);
     setNotice("");
     setCopied({});
+    setExpanded({});
     batchRunningRef.current = true;
 
     for (let i = 0; i < initial.length; i++) {
@@ -543,6 +558,23 @@ export default function Home() {
   }
 
   const showBatchInput = mode === "multi-topic" || mode === "multi-version";
+  const allExpanded = NODE_ORDER.every((id) => expanded[id]);
+
+  function toggleAll() {
+    if (allExpanded) {
+      setExpanded({});
+      return;
+    }
+    setExpanded(
+      NODE_ORDER.reduce(
+        (acc, id) => {
+          acc[id] = true;
+          return acc;
+        },
+        {} as Partial<Record<NodeId, boolean>>,
+      ),
+    );
+  }
 
   return (
     <main className="mx-auto flex w-full max-w-6xl flex-1 flex-col gap-6 px-6 py-10">
@@ -693,6 +725,12 @@ export default function Home() {
           <span className="text-xs text-neutral-400">runId: {currentRunId.slice(0, 8)}</span>
         )}
         {notice && <span className="text-red-600">{notice}</span>}
+        <button
+          onClick={toggleAll}
+          className="ml-auto rounded-md border border-neutral-300 bg-white px-2.5 py-1 text-xs"
+        >
+          {allExpanded ? "全部收起" : "全部展开"}
+        </button>
       </div>
 
       {/* 批量模式 tabs */}
@@ -728,11 +766,12 @@ export default function Home() {
       )}
 
       {/* 卡片区 */}
-      <div className="grid grid-cols-1 gap-4 md:grid-cols-4">
+      <div className="grid grid-cols-1 gap-4 md:grid-cols-4 md:items-start">
         {NODE_ORDER.map((nodeId) => {
           const node = currentNodes[nodeId];
           const style = STATUS_STYLE[node.status];
           const isPlanner = nodeId === "planner";
+          const isExpanded = !!expanded[nodeId];
           const canStop = node.status === "running" || node.status === "pending";
           const canRerun =
             !isPlanner &&
@@ -748,50 +787,27 @@ export default function Home() {
                 isPlanner ? "md:col-span-4" : ""
               }`}
             >
-              <div className="flex items-start justify-between gap-2">
-                <div className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={() => toggleNode(nodeId)}
+                className="flex w-full items-start justify-between gap-2 text-left"
+              >
+                <span className="flex items-center gap-2">
                   <span className={`h-2 w-2 rounded-full ${style.dot}`} />
-                  <h2 className="text-sm font-semibold">{NODE_META[nodeId].name}</h2>
-                </div>
-                <span className="rounded-full bg-white/70 px-2 py-0.5 text-xs text-neutral-600">
-                  {style.label}
-                  {node.attempt > 1 ? ` · 第${node.attempt}次` : ""}
+                  <span className="text-sm font-semibold">{NODE_META[nodeId].name}</span>
                 </span>
-              </div>
+                <span className="flex items-center gap-2">
+                  <span className="rounded-full bg-white/70 px-2 py-0.5 text-xs text-neutral-600">
+                    {style.label}
+                    {node.attempt > 1 ? ` · 第${node.attempt}次` : ""}
+                  </span>
+                  <span className="text-xs text-neutral-400">
+                    {isExpanded ? "收起" : "展开"}
+                  </span>
+                </span>
+              </button>
 
               <p className="text-xs text-neutral-500">{NODE_META[nodeId].desc}</p>
-
-              <div className="flex gap-2">
-                <button
-                  onClick={() => handleStopNode(nodeId)}
-                  disabled={!isRunning || !canStop}
-                  className="rounded-md border border-neutral-300 bg-white px-2.5 py-1 text-xs disabled:opacity-40"
-                >
-                  中断
-                </button>
-                {!isPlanner && (
-                  <button
-                    onClick={() => handleRerun(nodeId)}
-                    disabled={!canRerun}
-                    className="rounded-md border border-neutral-300 bg-white px-2.5 py-1 text-xs disabled:opacity-40"
-                  >
-                    重跑
-                  </button>
-                )}
-                {!isPlanner && nodeId !== "image" && node.status === "completed" && (
-                  <button
-                    onClick={() => handleCopy(nodeId)}
-                    disabled={!!copied[nodeId]}
-                    className={`rounded-md border px-2.5 py-1 text-xs ${
-                      copied[nodeId]
-                        ? "border-neutral-200 bg-neutral-100 text-neutral-400"
-                        : "border-neutral-300 bg-white"
-                    }`}
-                  >
-                    {copied[nodeId] ? "已复制" : "复制"}
-                  </button>
-                )}
-              </div>
 
               {node.error && (
                 <p className="rounded-md bg-red-100 px-2 py-1 text-xs text-red-700">
@@ -799,39 +815,101 @@ export default function Home() {
                 </p>
               )}
 
-              {nodeId === "image" && node.imageUrl && (
-                <>
-                  {/* eslint-disable-next-line @next/next/no-img-element */}
-                  <img
-                    src={node.imageUrl}
-                    alt="配图结果"
-                    className="w-full rounded-lg border border-neutral-200 object-cover"
-                  />
-                  <button
-                    onClick={handleDownloadImage}
-                    className="self-start rounded-md border border-neutral-300 bg-white px-2.5 py-1 text-xs"
-                  >
-                    下载图片
-                  </button>
-                </>
+              {/* 折叠态：只给状态和内容预览 */}
+              {!isExpanded && (
+                <div className="flex flex-col gap-2">
+                  {nodeId === "image" && node.imageUrl && (
+                    // eslint-disable-next-line @next/next/no-img-element
+                    <img
+                      src={node.imageUrl}
+                      alt="配图结果"
+                      className="w-full rounded-lg border border-neutral-200 object-cover"
+                    />
+                  )}
+                  {node.content ? (
+                    <>
+                      <p className="truncate text-xs text-neutral-600">
+                        {node.content.trim().split("\n")[0]}
+                      </p>
+                      <span className="text-[11px] text-neutral-400">
+                        已生成 {node.content.length} 字
+                      </span>
+                    </>
+                  ) : (
+                    <span className="text-[11px] text-neutral-400">（暂无内容）</span>
+                  )}
+                </div>
               )}
 
-              {nodeId === "image" &&
-                node.status === "running" &&
-                !node.imageUrl &&
-                node.content && (
-                  <p className="rounded-md bg-blue-100 px-2 py-1 text-xs text-blue-700">
-                    提示词已生成，正在调用 Seedream 出图…
-                  </p>
-                )}
+              {isExpanded && (
+                <>
+                  <div className="flex gap-2">
+                    <button
+                      onClick={() => handleStopNode(nodeId)}
+                      disabled={!isRunning || !canStop}
+                      className="rounded-md border border-neutral-300 bg-white px-2.5 py-1 text-xs disabled:opacity-40"
+                    >
+                      中断
+                    </button>
+                    {!isPlanner && (
+                      <button
+                        onClick={() => handleRerun(nodeId)}
+                        disabled={!canRerun}
+                        className="rounded-md border border-neutral-300 bg-white px-2.5 py-1 text-xs disabled:opacity-40"
+                      >
+                        重跑
+                      </button>
+                    )}
+                    {!isPlanner && nodeId !== "image" && node.status === "completed" && (
+                      <button
+                        onClick={() => handleCopy(nodeId)}
+                        disabled={!!copied[nodeId]}
+                        className={`rounded-md border px-2.5 py-1 text-xs ${
+                          copied[nodeId]
+                            ? "border-neutral-200 bg-neutral-100 text-neutral-400"
+                            : "border-neutral-300 bg-white"
+                        }`}
+                      >
+                        {copied[nodeId] ? "已复制" : "复制"}
+                      </button>
+                    )}
+                  </div>
 
-              <pre
-                className={`overflow-auto whitespace-pre-wrap break-words rounded-lg bg-white/70 p-3 text-xs leading-relaxed text-neutral-700 ${
-                  isPlanner ? "max-h-64" : "max-h-80 min-h-32"
-                }`}
-              >
-                {node.content || "（暂无内容）"}
-              </pre>
+                  {nodeId === "image" && node.imageUrl && (
+                    <>
+                      {/* eslint-disable-next-line @next/next/no-img-element */}
+                      <img
+                        src={node.imageUrl}
+                        alt="配图结果"
+                        className="w-full rounded-lg border border-neutral-200 object-cover"
+                      />
+                      <button
+                        onClick={handleDownloadImage}
+                        className="self-start rounded-md border border-neutral-300 bg-white px-2.5 py-1 text-xs"
+                      >
+                        下载图片
+                      </button>
+                    </>
+                  )}
+
+                  {nodeId === "image" &&
+                    node.status === "running" &&
+                    !node.imageUrl &&
+                    node.content && (
+                      <p className="rounded-md bg-blue-100 px-2 py-1 text-xs text-blue-700">
+                        提示词已生成，正在调用 Seedream 出图…
+                      </p>
+                    )}
+
+                  <pre
+                    className={`overflow-auto whitespace-pre-wrap break-words rounded-lg bg-white/70 p-3 text-xs leading-relaxed text-neutral-700 ${
+                      isPlanner ? "max-h-64" : "max-h-80"
+                    }`}
+                  >
+                    {node.content || "（暂无内容）"}
+                  </pre>
+                </>
+              )}
             </section>
           );
         })}
