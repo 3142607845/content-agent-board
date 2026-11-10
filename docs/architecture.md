@@ -117,20 +117,56 @@ data: {"nodeId":"planner","message":"JSON 解析失败（已重试1次）"}
 | 策划 Agent | `deepseek-v4-1-flash-261017` | 结构化拆解和 JSON 输出稳定 |
 | 长文 Agent | `deepseek-v4-1-flash-261017` | 擅长长文逻辑结构 |
 | 脚本 Agent | `deepseek-v4-1-flash-261017` | 擅长分镜格式输出 |
-| 小红书 Agent | `doubao-seed-2-1-pro-260915` | 中文网感好，擅长情绪表达和标签 |
+| 小红书 Agent | `glm-5-3-flash-260828` | 与长文/脚本同速度量级，避免看板上显得没同步启动 |
 | 配图 Agent（扩写） | `doubao-seed-2-1-pro-260915` | 中文视觉描述能力强 |
 | 配图 Agent（出图） | `doubao-seedream-5-0-flash-260915` | 文生图专用，出图质量好 |
 
 所有模型共用同一个方舟 API Key，仅通过 `model_id` 切换，不需要对接多个服务商。
 
+## 三种运行模式
+
+一次 run 始终是「1 个选题 → 1 条流水线」。批量能力由前端串行拉起多次 run 实现，每个 run 独立连一条 SSE。
+
+| 模式 | 行为 | 请求差异 |
+|---|---|---|
+| 单次生成 | 一个选题跑一条流水线 | 只传 `topic` |
+| 批量选题 | 多行输入（最多 3 个）逐条跑 | 每条 run 只传 `topic` |
+| 多版生成 | 同一选题跑 3 次，每次注入一个创作维度 | 额外传 `variant` |
+
+前端用 `tasks[]` 维护批量结果，每个元素含自己的 `nodes` 与 `runId`，tab 切换时只切展示数据源，不重连。
+
+### 多版生成的差异化提纲
+
+多版不是「同一份 prompt 跑三次」，而是**定向生成三种结构不同的提纲**。三个维度定义在 `lib/variants.ts`（纯数据，前后端共用）：
+
+| 变体 | 定位 | 长文骨架 |
+|---|---|---|
+| 深度分析版 | 靠逻辑与证据说服 | 矛盾现象切入 → 论点+论据 → 反面观点与回应 → 可执行建议 |
+| 故事化叙述版 | 靠人物与冲突代入 | 具体人物场景 → 冲突困境 → 转变过程 → 一句短观点 |
+| 科普入门版 | 零基础，用类比降门槛 | 生活类比 → 分步拆解 → 常见误区 → 一句话总结 |
+
+变体注入路径：
+
+```
+page.tsx (variant)
+  → POST /api/run（isVariantKey 校验，非法返回 400）
+  → createRun(topic, variant) 存入 RunState.variant
+  → runPlanner 构造 new PlannerAgent(run.variant)
+  → 构造函数把 promptBlock 追加到 system prompt
+```
+
+约束：**差异化必须落在结构骨架上**（段落推进步骤、论据类型、配图风格），只换形容词模型仍会输出同质提纲。下游 4 个 Agent 不额外感知变体，提纲已携带角度与结构。`variant` 为可选参数，不传时行为与单次模式一致；`rerunNode` 复用 `run.outline`，变体信息天然保留。
+
 ## 技术架构
 
 ```
 ┌─────────────────────────────────────────────────────┐
-│ 前端看板 (Next.js + React Flow)                      │
-│ - 节点画布：策划节点 + 4 个内容节点                    │
+│ 前端看板 (Next.js + React，卡片网格)                  │
+│ - 模式切换：单次 / 批量选题 / 多版生成                 │
+│ - 卡片区：策划卡（整行）+ 4 张内容卡（一行四列）        │
 │ - 状态：pending / running / completed / failed        │
-│ - 控制：开始、全部中断、单节点重跑                      │
+│ - 控制：开始、全部中断、单节点中断/重跑、折叠展开       │
+│ - 批量：进度条 + 任务 tabs                            │
 └──────────────────────┬──────────────────────────────┘
                        │ SSE 单向流式推送
                        ▼
@@ -162,8 +198,9 @@ data: {"nodeId":"planner","message":"JSON 解析失败（已重试1次）"}
 
 1. **编排引擎自研**：场景是固定的「策划 → 4 路并行」，不需要 LangGraph 的条件分支能力，自研状态机更轻量、更易讲解。
 2. **SSE 而非 WebSocket**：只需要后端向前端单向推送状态和内容，SSE 足够且更简单。需处理断连重连和 Last-Event-ID。
-3. **React Flow 做看板**：节点状态用颜色区分（灰/蓝/绿/红），节点内展示内容预览，点击展开完整产出。
-4. **中断逻辑**：每个 Node 单独持有独立的 AbortController，不共用全局 signal；abort 只切断 LLM 流式请求，不清空 node.content。具体规则：
+3. **看板用卡片网格，不用节点画布**：曾尝试 React Flow 做节点画布，实测否决——4 个内容节点摆成 2×2 会暗示「长文 → 脚本 → 小红书 → 配图」的先后顺序，而它们实际完全并行，布局在误导架构；拖拽时画布平移还会抢走节点拖拽事件。改为「策划卡整行 + 4 张内容卡一行四列」，同样表达 1 上游 + 4 并行，且更省空间。
+4. **结果卡片默认折叠，运行时自动展开**：默认折叠让看板紧凑，但节点开始运行时必须自动展开——否则 4 个 Agent 并行流式吐字这个核心能力在界面上看不见。展开态内容区固定 `max-h` + `overflow-auto`，滚动限制在卡片内，不让页面高度暴涨。
+5. **中断逻辑**：每个 Node 单独持有独立的 AbortController，不共用全局 signal；abort 只切断 LLM 流式请求，不清空 node.content。具体规则：
    - **全局中断（策划阶段）**：策划节点停止生成，已输出内容保留并标记为 `cancelled`；4 个后置节点状态标记为 `cancelled`，不再启动。
    - **全局中断（并行阶段）**：策划节点已完成保持不动；已完成的节点内容保留不动；正在流式输出的节点立刻停止拉取新 token、已生成文字保留；还没启动的 pending 节点标记为 cancelled，不再启动。
    - **单节点中断**：仅指定节点停止生成、已有内容保留；策划及其他所有节点不受影响，正常跑、内容保留；其他 pending 节点继续正常调度执行。
@@ -172,10 +209,9 @@ data: {"nodeId":"planner","message":"JSON 解析失败（已重试1次）"}
 
 | 模块 | 文件 | 职责 |
 |---|---|---|
-| 看板页面 | app/page.tsx | React Flow 画布、控制按钮、选题输入 |
-| 节点组件 | components/AgentNode.tsx | 单个 Agent 节点 UI |
-| SSE Hook | hooks/useRunStream.ts | 连接流接口，更新状态 |
-| 启动接口 | app/api/run/route.ts | 创建 run，启动编排 |
+| 看板页面 | app/page.tsx | 三种模式、卡片网格、SSE 接入、折叠/进度条、导出 |
+| 创作维度定义 | lib/variants.ts | 三个变体的名称、定位、结构骨架（纯数据，前后端共用） |
+| 启动接口 | app/api/run/route.ts | 创建 run（可选 variant），启动编排 |
 | 流接口 | app/api/stream/[runId]/route.ts | SSE 推送 |
 | 中断接口 | app/api/stop/[runId]/route.ts | 中断全部；带 nodeId 则只中断指定节点 |
 | 重跑接口 | app/api/rerun/[nodeId]/route.ts | 重跑单节点 |
@@ -183,4 +219,5 @@ data: {"nodeId":"planner","message":"JSON 解析失败（已重试1次）"}
 | Agent 基类 | lib/agents/base.ts | 模型调用、流式、AbortSignal |
 | 各 Agent | lib/agents/*.ts | 各自 prompt + 模型配置 |
 | 模型封装 | lib/llm.ts | 统一 API 调用 |
-| 图像封装 | lib/image.ts | 文生图接口调用（Seedream） |
+| 图像封装 | lib/image.ts | 文生图接口调用（Seedream），返回 base64 后落地到 `public/generated/` |
+| 图片存储 | public/generated/ | 出图产物本地持久化，前端以 `/generated/xxx.png` 引用（仅本地可用，Vercel 只读环境不可写） |
