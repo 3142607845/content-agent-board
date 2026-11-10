@@ -1,0 +1,4 @@
+* text=auto
+
+# Windows 批处理必须以 CRLF 存储，否则在部分环境下双击执行会解析异常
+*.bat text eol=crlf
