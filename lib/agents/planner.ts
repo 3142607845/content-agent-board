@@ -1,4 +1,5 @@
 import { BaseAgent } from "./base";
+import { getVariant, type VariantKey } from "../variants";
 
 const SYSTEM_PROMPT = `你是一个自媒体内容策划，负责把一个选题拆解成四个渠道的创作提纲。
 
@@ -47,12 +48,23 @@ const SYSTEM_PROMPT = `你是一个自媒体内容策划，负责把一个选题
  *
  * 流水线第一个节点，输出 4 个渠道的提纲 JSON，作为后置 4 个 Agent 的输入。
  * 唯一开启 response_format: json_object 的 Agent。
+ *
+ * 传入 variant 时，会把对应的结构骨架追加进 system prompt，
+ * 让多版模式产出「维度不同」的提纲，而不是同一份提纲的随机变体。
  */
 export class PlannerAgent extends BaseAgent {
   readonly id = "planner";
   readonly name = "策划 Agent";
-  readonly systemPrompt = SYSTEM_PROMPT;
   readonly modelId = "deepseek-v4-1-flash-261017";
   readonly temperature = 0.3;
   readonly responseFormat = "json_object" as const;
+  readonly systemPrompt: string;
+
+  constructor(variant?: VariantKey) {
+    super();
+    const spec = getVariant(variant);
+    this.systemPrompt = spec
+      ? `${SYSTEM_PROMPT}\n\n## 创作版本约束（优先级高于上面的通用要求）\n\n${spec.promptBlock}`
+      : SYSTEM_PROMPT;
+  }
 }

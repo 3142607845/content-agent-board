@@ -7,6 +7,7 @@ import type {
   NodeStatus,
   RunStatus,
 } from "@/lib/orchestrator";
+import { VARIANTS, type VariantKey } from "@/lib/variants";
 
 const NODE_ORDER: NodeId[] = ["planner", "longform", "script", "xhs", "image"];
 
@@ -68,6 +69,8 @@ interface TaskResult {
   id: string;
   topic: string;
   label: string;
+  /** 多版模式：该任务对应的创作维度 */
+  variant?: VariantKey;
   status: "pending" | "running" | "completed" | "failed" | "aborted";
   nodes: Record<NodeId, AgentNodeState>;
   runId?: string;
@@ -91,7 +94,6 @@ export default function Home() {
   const [mode, setMode] = useState<Mode>("single");
   const [topic, setTopic] = useState("");
   const [multiTopic, setMultiTopic] = useState("");
-  const [versionCount, setVersionCount] = useState(3);
 
   // 单次模式状态
   const [nodes, setNodes] = useState<Record<NodeId, AgentNodeState>>(emptyNodes);
@@ -368,7 +370,7 @@ export default function Home() {
 
   // 批量：开始
   async function handleStartBatch() {
-    let taskList: { topic: string; label: string }[] = [];
+    let taskList: { topic: string; label: string; variant?: VariantKey }[] = [];
     if (mode === "multi-topic") {
       const topics = multiTopic
         .split("\n")
@@ -380,9 +382,11 @@ export default function Home() {
     } else {
       const t = topic.trim();
       if (!t) return;
-      taskList = Array.from({ length: versionCount }, (_, i) => ({
+      // 多版模式固定三个创作维度，不再让用户选数量
+      taskList = VARIANTS.map((v) => ({
         topic: t,
-        label: `版本 ${i + 1}`,
+        label: v.name,
+        variant: v.key,
       }));
     }
 
@@ -390,6 +394,7 @@ export default function Home() {
       id: `${Date.now()}-${i}`,
       topic: t.topic,
       label: t.label,
+      variant: t.variant,
       status: "pending",
       nodes: emptyNodes(),
     }));
@@ -415,7 +420,10 @@ export default function Home() {
         const res = await fetch("/api/run", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ topic: initial[i].topic }),
+          body: JSON.stringify({
+            topic: initial[i].topic,
+            ...(initial[i].variant ? { variant: initial[i].variant } : {}),
+          }),
         });
         const data = (await res.json()) as { runId?: string; error?: string };
         if (!res.ok || !data.runId) throw new Error(data.error ?? `启动失败 ${res.status}`);
@@ -610,31 +618,23 @@ export default function Home() {
               className="w-full rounded-lg border border-neutral-300 bg-white px-4 py-3 text-sm outline-none focus:border-neutral-500"
             />
           ) : (
-            <div className="flex flex-col gap-3 sm:flex-row">
+            <div className="flex flex-col gap-3">
               <input
                 value={topic}
                 onChange={(e) => setTopic(e.target.value)}
-                placeholder="输入一个选题"
-                className="flex-1 rounded-lg border border-neutral-300 bg-white px-4 py-2.5 text-sm outline-none focus:border-neutral-500"
+                placeholder="输入一个选题，将按三个维度各生成一版"
+                className="w-full rounded-lg border border-neutral-300 bg-white px-4 py-2.5 text-sm outline-none focus:border-neutral-500"
               />
-              <div className="flex items-center gap-2">
-                <span className="text-sm text-neutral-500">版本数</span>
-                <select
-                  value={versionCount}
-                  onChange={(e) => {
-                    setVersionCount(Number(e.target.value));
-                    setTasks([]);
-                    setActiveTaskIndex(0);
-                  }}
-                  disabled={isRunning}
-                  className="rounded-lg border border-neutral-300 bg-white px-3 py-2.5 text-sm disabled:opacity-40"
-                >
-                  {[2, 3, 4].map((n) => (
-                    <option key={n} value={n}>
-                      {n}
-                    </option>
-                  ))}
-                </select>
+              <div className="flex flex-wrap gap-2">
+                {VARIANTS.map((v) => (
+                  <div
+                    key={v.key}
+                    className="flex flex-col gap-0.5 rounded-lg border border-neutral-200 bg-white px-3 py-2"
+                  >
+                    <span className="text-xs font-medium text-neutral-800">{v.name}</span>
+                    <span className="text-[11px] text-neutral-400">{v.angle}</span>
+                  </div>
+                ))}
               </div>
             </div>
           )}

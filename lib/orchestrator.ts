@@ -3,6 +3,7 @@ import { LongformAgent } from "./agents/longform";
 import { ScriptAgent } from "./agents/script";
 import { XhsAgent } from "./agents/xhs";
 import { ImageAgent } from "./agents/image";
+import type { VariantKey } from "./variants";
 
 /**
  * 编排引擎
@@ -63,6 +64,8 @@ export type StreamEvent =
 export interface RunState {
   id: string;
   topic: string;
+  /** 多版模式的创作维度；单次模式不传，策划按通用提纲生成 */
+  variant: VariantKey | null;
   status: RunStatus;
   nodes: Record<NodeId, AgentNodeState>;
   /** 策划解析成功后的提纲对象，单节点重跑时复用 */
@@ -127,10 +130,11 @@ function emit(run: RunState, event: StreamEvent) {
 }
 
 /** 创建一次运行，不启动，由调用方决定何时 startRun */
-export function createRun(topic: string): RunState {
+export function createRun(topic: string, variant?: VariantKey): RunState {
   const run: RunState = {
     id: crypto.randomUUID(),
     topic,
+    variant: variant ?? null,
     status: "running",
     nodes: initNodes(),
     outline: null,
@@ -202,7 +206,7 @@ async function execute(run: RunState): Promise<void> {
  * 返回 true 表示拿到了合法 JSON 提纲，可以启动下游。
  */
 async function runPlanner(run: RunState): Promise<boolean> {
-  const agent = new PlannerAgent();
+  const agent = new PlannerAgent(run.variant ?? undefined);
 
   for (let attempt = 1; attempt <= PLANNER_MAX_ATTEMPTS; attempt++) {
     if (run.status === "aborted") return false;
