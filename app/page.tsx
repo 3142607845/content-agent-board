@@ -560,6 +560,15 @@ export default function Home() {
   const showBatchInput = mode === "multi-topic" || mode === "multi-version";
   const allExpanded = NODE_ORDER.every((id) => expanded[id]);
 
+  // 批量模式全局进度：只把 completed 计入已完成，失败/中断单独统计
+  const batchTotal = tasks.length;
+  const batchCompleted = tasks.filter((t) => t.status === "completed").length;
+  const batchFailed = tasks.filter((t) => t.status === "failed").length;
+  const batchAborted = tasks.filter((t) => t.status === "aborted").length;
+  const batchRunning = tasks.find((t) => t.status === "running");
+  const batchPercent = batchTotal > 0 ? Math.round((batchCompleted / batchTotal) * 100) : 0;
+  const batchUnit = mode === "multi-version" ? "版" : "选题";
+
   function toggleAll() {
     if (allExpanded) {
       setExpanded({});
@@ -732,6 +741,34 @@ export default function Home() {
           {allExpanded ? "全部收起" : "全部展开"}
         </button>
       </div>
+
+      {/* 批量模式全局进度 */}
+      {mode !== "single" && batchTotal > 0 && (
+        <div className="flex flex-col gap-2">
+          <div className="flex flex-wrap items-center gap-3 text-xs">
+            <span className="font-medium text-neutral-700">
+              批量 {batchTotal} {batchUnit}：已完成 {batchCompleted}/{batchTotal}
+              {batchRunning
+                ? `，当前运行 ${batchRunning.label}`
+                : batchCompleted === batchTotal
+                  ? "，全部完成"
+                  : ""}
+            </span>
+            {batchFailed > 0 && (
+              <span className="text-red-600">失败 {batchFailed}</span>
+            )}
+            {batchAborted > 0 && (
+              <span className="text-amber-600">已中断 {batchAborted}</span>
+            )}
+          </div>
+          <div className="h-1.5 w-full overflow-hidden rounded-full bg-neutral-200">
+            <div
+              className="h-full rounded-full bg-emerald-500 transition-all"
+              style={{ width: `${batchPercent}%` }}
+            />
+          </div>
+        </div>
+      )}
 
       {/* 批量模式 tabs */}
       {mode !== "single" && tasks.length > 0 && (
