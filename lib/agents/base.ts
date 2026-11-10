@@ -1,9 +1,11 @@
-import { streamChat, type ChatMessage } from "../llm";
+import { streamChat, type ChatMessage, type TokenUsage } from "../llm";
 
 export interface AgentRunOptions {
   signal?: AbortSignal;
   /** 每收到一个 token 回调一次，用于 SSE 推给前端 */
   onToken?: (token: string) => void;
+  /** 流结束时回调 token 用量，服务端未返回 usage 时不触发 */
+  onUsage?: (usage: TokenUsage) => void;
 }
 
 /**
@@ -42,6 +44,7 @@ export abstract class BaseAgent {
       responseFormat: this.responseFormat,
       signal: options.signal,
       onToken: options.onToken,
+      onUsage: options.onUsage,
     });
   }
 }

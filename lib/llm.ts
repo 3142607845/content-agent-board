@@ -12,6 +12,20 @@ export interface ChatMessage {
   content: string;
 }
 
+/**
+ * 一次模型调用的 token 用量。
+ *
+ * completionTokens 包含 reasoningTokens（思维链），
+ * 所以「输出 token 数」可能明显大于正文字数，这不是算错。
+ */
+export interface TokenUsage {
+  promptTokens: number;
+  completionTokens: number;
+  totalTokens: number;
+  reasoningTokens?: number;
+  cachedTokens?: number;
+}
+
 export interface StreamChatOptions {
   /** 方舟上的模型 id，或推理接入点 id（ep-xxxx） */
   model: string;
@@ -25,9 +39,36 @@ export interface StreamChatOptions {
   signal?: AbortSignal;
   /** 每收到一个 token 回调一次 */
   onToken?: (token: string) => void;
+  /**
+   * 流结束时回调一次 token 用量。
+   * 服务端不返回 usage 时不会触发，调用方需要自行降级。
+   */
+  onUsage?: (usage: TokenUsage) => void;
 }
 
 const DEFAULT_BASE_URL = "https://ark.cn-beijing.volces.com/api/v3";
+
+function toNumber(value: unknown): number {
+  return typeof value === "number" && Number.isFinite(value) ? value : 0;
+}
+
+/**
+ * 解析方舟返回的 usage。
+ * 中间分片会带 "usage": null，只在最后一片给真实值，所以调用方要判空。
+ */
+function parseUsage(raw: unknown): TokenUsage | null {
+  if (!raw || typeof raw !== "object") return null;
+  const u = raw as Record<string, unknown>;
+  const completionDetails = (u.completion_tokens_details ?? {}) as Record<string, unknown>;
+  const promptDetails = (u.prompt_tokens_details ?? {}) as Record<string, unknown>;
+  return {
+    promptTokens: toNumber(u.prompt_tokens),
+    completionTokens: toNumber(u.completion_tokens),
+    totalTokens: toNumber(u.total_tokens),
+    reasoningTokens: toNumber(completionDetails.reasoning_tokens) || undefined,
+    cachedTokens: toNumber(promptDetails.cached_tokens) || undefined,
+  };
+}
 
 function getConfig() {
   const apiKey = process.env.ARK_API_KEY;
@@ -53,6 +94,7 @@ export async function streamChat(options: StreamChatOptions): Promise<string> {
     temperature = 0.3,
     signal,
     onToken,
+    onUsage,
   } = options;
 
   const body: Record<string, unknown> = {
@@ -60,6 +102,8 @@ export async function streamChat(options: StreamChatOptions): Promise<string> {
     messages,
     stream: true,
     temperature,
+    // 让服务端在流末尾补一片 usage，用于统计 token 消耗
+    stream_options: { include_usage: true },
   };
   if (responseFormat) {
     body.response_format = { type: responseFormat };
@@ -110,6 +154,11 @@ export async function streamChat(options: StreamChatOptions): Promise<string> {
         // 单个分片解析失败不影响整体，跳过
         continue;
       }
+
+      // usage 只在最后一片给出，且中间分片是 null。
+      // 必须放在 choices 判空之前：服务端可能返回 choices 为空、只带 usage 的收尾分片。
+      const usage = parseUsage((json as { usage?: unknown }).usage);
+      if (usage) onUsage?.(usage);
 
       const choices = (json as { choices?: unknown }).choices;
       if (!Array.isArray(choices) || choices.length === 0) continue;

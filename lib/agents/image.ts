@@ -1,5 +1,6 @@
 import { BaseAgent } from "./base";
 import { generateImage } from "../image";
+import type { TokenUsage } from "../llm";
 
 const SYSTEM_PROMPT = `你是一个 AI 绘图提示词工程师，负责把选题和配图描述转写成一条可直接出图的提示词。
 
@@ -45,10 +46,15 @@ export class ImageAgent extends BaseAgent {
       signal?: AbortSignal;
       onToken?: (token: string) => void;
       onPrompt?: (prompt: string) => void;
+      onUsage?: (usage: TokenUsage) => void;
     } = {},
   ): Promise<{ prompt: string; imageUrl: string }> {
     const prompt = (
-      await this.run(input, { signal: options.signal, onToken: options.onToken })
+      await this.run(input, {
+        signal: options.signal,
+        onToken: options.onToken,
+        onUsage: options.onUsage,
+      })
     ).trim();
 
     options.onPrompt?.(prompt);
