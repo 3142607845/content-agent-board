@@ -6,7 +6,13 @@
  *
  * 配置读取和 llm.ts 保持一致：同样两个环境变量。
  * 暂不抽公共模块，避免改动已验收的代码。
+ *
+ * 出图直接要 base64 并落盘到 public/generated，避免依赖方舟返回的 24 小时临时签名链接。
  */
+
+import { mkdir, writeFile } from "node:fs/promises";
+import path from "node:path";
+import { randomUUID } from "node:crypto";
 
 export interface GenerateImageOptions {
   /** 出图提示词 */
@@ -19,11 +25,13 @@ export interface GenerateImageOptions {
 }
 
 export interface GeneratedImage {
+  /** 落盘后的站内路径，例如 /generated/xxx.png */
   url: string;
 }
 
 const DEFAULT_BASE_URL = "https://ark.cn-beijing.volces.com/api/v3";
 const DEFAULT_IMAGE_MODEL = "doubao-seedream-5-0-flash-260915";
+const GENERATED_DIR = path.join(process.cwd(), "public", "generated");
 
 function getConfig() {
   const apiKey = process.env.ARK_API_KEY;
@@ -60,7 +68,7 @@ export async function generateImage(
       model,
       prompt,
       size,
-      response_format: "url",
+      response_format: "b64_json",
       watermark: false,
     }),
     signal,
@@ -72,13 +80,20 @@ export async function generateImage(
   }
 
   const json = (await res.json()) as {
-    data?: Array<{ url?: string }>;
+    data?: Array<{ b64_json?: string }>;
   };
 
-  const url = json.data?.[0]?.url;
-  if (!url) {
-    throw new Error("图片生成成功但没有返回 url");
+  const raw = json.data?.[0]?.b64_json;
+  if (!raw) {
+    throw new Error("图片生成成功但没有返回 b64_json");
   }
 
-  return { url };
+  // 兼容可能带 data:image/...;base64, 前缀的返回
+  const base64 = raw.replace(/^data:image\/\w+;base64,/, "");
+
+  await mkdir(GENERATED_DIR, { recursive: true });
+  const filename = `${randomUUID()}.png`;
+  await writeFile(path.join(GENERATED_DIR, filename), Buffer.from(base64, "base64"));
+
+  return { url: `/generated/${filename}` };
 }

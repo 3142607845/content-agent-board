@@ -32,3 +32,6 @@ Thumbs.db
 next-env.d.ts
 *.tsbuildinfo
 .vercel
+
+# 运行时生成的配图
+public/generated/
