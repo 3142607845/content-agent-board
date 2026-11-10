@@ -5,8 +5,10 @@ import type {
   AgentNodeState,
   NodeId,
   NodeStatus,
+  RunSnapshot,
   RunStatus,
 } from "@/lib/orchestrator";
+import { formatDuration, formatTokens, type RunReport } from "@/lib/report";
 import { VARIANTS, type VariantKey } from "@/lib/variants";
 
 const NODE_ORDER: NodeId[] = ["planner", "longform", "script", "xhs", "image"];
@@ -74,6 +76,8 @@ interface TaskResult {
   status: "pending" | "running" | "completed" | "failed" | "aborted";
   nodes: Record<NodeId, AgentNodeState>;
   runId?: string;
+  /** 该任务跑完后由服务端下发的执行报告 */
+  report?: RunReport | null;
 }
 
 function emptyNodes(): Record<NodeId, AgentNodeState> {
@@ -88,6 +92,161 @@ function emptyNodes(): Record<NodeId, AgentNodeState> {
     };
   }
   return nodes;
+}
+
+const REPORT_STATUS_TEXT: Record<string, string> = {
+  completed: "完成",
+  running: "生成中",
+  failed: "失败",
+  cancelled: "已中断",
+  pending: "未启动",
+};
+
+function variantLabel(key: string | null): string {
+  if (!key) return "";
+  return VARIANTS.find((v) => v.key === key)?.name ?? key;
+}
+
+/** 单次运行的执行报告，数据全部来自服务端下发的 RunReport */
+function ReportCard({ report, title = "本次流水线执行报告" }: { report: RunReport; title?: string }) {
+  return (
+    <section className="rounded-xl border border-neutral-200 bg-white p-4">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <h2 className="text-sm font-semibold">{title}</h2>
+        <span className="text-xs text-neutral-400">
+          总耗时 {formatDuration(report.durationMs)}
+        </span>
+      </div>
+      <p className="mt-1 text-xs text-neutral-500">
+        {report.topic}
+        {report.variant ? ` · ${variantLabel(report.variant)}` : ""}
+      </p>
+
+      <div className="mt-3 overflow-x-auto">
+        <table className="w-full min-w-[620px] text-left text-xs">
+          <thead className="text-neutral-400">
+            <tr>
+              <th className="py-1 pr-3 font-normal">节点</th>
+              <th className="py-1 pr-3 font-normal">模型</th>
+              <th className="py-1 pr-3 font-normal">状态</th>
+              <th className="py-1 pr-3 font-normal">耗时</th>
+              <th className="py-1 pr-3 font-normal">输入 token</th>
+              <th className="py-1 pr-3 font-normal">输出 token</th>
+              <th className="py-1 font-normal">重试</th>
+            </tr>
+          </thead>
+          <tbody>
+            {report.nodes.map((n) => (
+              <tr key={n.nodeId} className="border-t border-neutral-100">
+                <td className="py-1.5 pr-3 font-medium text-neutral-700">{n.name}</td>
+                <td className="py-1.5 pr-3 font-mono text-[11px] text-neutral-500">
+                  {n.model}
+                </td>
+                <td className="py-1.5 pr-3">
+                  {REPORT_STATUS_TEXT[n.status] ?? n.status}
+                </td>
+                <td className="py-1.5 pr-3">
+                  {n.attempts > 0 ? formatDuration(n.durationMs) : "—"}
+                </td>
+                <td className="py-1.5 pr-3">
+                  {n.usage ? formatTokens(n.usage.promptTokens) : "—"}
+                </td>
+                <td className="py-1.5 pr-3">
+                  {n.usage ? formatTokens(n.usage.completionTokens) : "—"}
+                </td>
+                <td className="py-1.5">
+                  {n.retries > 0 ? (
+                    <span className="text-amber-600">{n.retries} 次</span>
+                  ) : (
+                    "—"
+                  )}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+
+      <div className="mt-3 flex flex-wrap gap-x-4 gap-y-1 text-xs text-neutral-600">
+        <span>模型调用 {report.totals.llmCalls} 次</span>
+        <span>token 合计 {formatTokens(report.totals.totalTokens)}</span>
+        {report.totals.reasoningTokens > 0 && (
+          <span>其中思维链 {formatTokens(report.totals.reasoningTokens)}</span>
+        )}
+        {report.totals.retries > 0 && (
+          <span className="text-amber-600">自动重试 {report.totals.retries} 次</span>
+        )}
+        {report.parallel?.speedup != null && (
+          <span className="text-emerald-600">
+            并行加速 {report.parallel.speedup}×（4 路串行需{" "}
+            {formatDuration(report.parallel.serialMs)}，实际{" "}
+            {formatDuration(report.parallel.wallMs)}）
+          </span>
+        )}
+        {report.hasEstimated && (
+          <span className="text-amber-600">含字符估算值，非服务端真实用量</span>
+        )}
+      </div>
+    </section>
+  );
+}
+
+/** 批量模式全部结束后的横向汇总，用来对比各版本的耗时与成本 */
+function BatchSummary({ tasks }: { tasks: TaskResult[] }) {
+  const totalTokens = tasks.reduce(
+    (sum, t) => sum + (t.report?.totals.totalTokens ?? 0),
+    0,
+  );
+  return (
+    <section className="rounded-xl border border-neutral-200 bg-white p-4">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <h2 className="text-sm font-semibold">批量执行汇总</h2>
+        <span className="text-xs text-neutral-400">
+          token 合计 {formatTokens(totalTokens)}
+        </span>
+      </div>
+      <div className="mt-3 overflow-x-auto">
+        <table className="w-full min-w-[520px] text-left text-xs">
+          <thead className="text-neutral-400">
+            <tr>
+              <th className="py-1 pr-3 font-normal">任务</th>
+              <th className="py-1 pr-3 font-normal">状态</th>
+              <th className="py-1 pr-3 font-normal">总耗时</th>
+              <th className="py-1 pr-3 font-normal">token 合计</th>
+              <th className="py-1 font-normal">自动重试</th>
+            </tr>
+          </thead>
+          <tbody>
+            {tasks.map((t) => (
+              <tr key={t.id} className="border-t border-neutral-100">
+                <td className="py-1.5 pr-3 font-medium text-neutral-700">
+                  {t.label}
+                </td>
+                <td className="py-1.5 pr-3">
+                  {REPORT_STATUS_TEXT[t.status] ?? t.status}
+                </td>
+                <td className="py-1.5 pr-3">
+                  {t.report ? formatDuration(t.report.durationMs) : "—"}
+                </td>
+                <td className="py-1.5 pr-3">
+                  {t.report ? formatTokens(t.report.totals.totalTokens) : "—"}
+                </td>
+                <td className="py-1.5">
+                  {t.report?.totals.retries ? (
+                    <span className="text-amber-600">
+                      {t.report.totals.retries} 次
+                    </span>
+                  ) : (
+                    "—"
+                  )}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </section>
+  );
 }
 
 export default function Home() {
@@ -105,6 +264,10 @@ export default function Home() {
   const [activeTaskIndex, setActiveTaskIndex] = useState(0);
 
   const [notice, setNotice] = useState("");
+  /** 单次模式下的执行报告，由 snapshot 或 run:done 下发 */
+  const [report, setReport] = useState<RunReport | null>(null);
+  /** SSE 断开重连提示，收到新快照自动清除 */
+  const [reconnectNotice, setReconnectNotice] = useState("");
   const [copied, setCopied] = useState<Partial<Record<NodeId, boolean>>>({});
   /** 卡片展开态；默认折叠，节点开始运行时自动展开 */
   const [expanded, setExpanded] = useState<Partial<Record<NodeId, boolean>>>({});
@@ -128,6 +291,8 @@ export default function Home() {
     mode === "single" ? runStatus : tasks[activeTaskIndex]?.status ?? "idle";
   const currentTopic =
     mode === "single" ? topic : tasks[activeTaskIndex]?.topic ?? topic;
+  const currentReport =
+    mode === "single" ? report : tasks[activeTaskIndex]?.report ?? null;
   const isRunning = currentTaskStatus === "running";
   const isCompleted = currentTaskStatus === "completed";
 
@@ -171,12 +336,13 @@ export default function Home() {
       esRef.current = es;
 
       es.addEventListener("snapshot", (ev) => {
-        const data = JSON.parse((ev as MessageEvent).data) as {
-          status: RunStatus;
-          nodes: Record<NodeId, AgentNodeState>;
-        };
-        setNodes(data.nodes);
-        setRunStatus(data.status);
+        // 断线重连时服务端会重新下发全量快照，这里整体替换即可，不需要回放事件
+        const snap = JSON.parse((ev as MessageEvent).data) as RunSnapshot;
+        setNodes(snap.nodes);
+        setRunStatus(snap.status);
+        setReport(snap.report);
+        setReconnectNotice("");
+        if (snap.status !== "running") es.close();
       });
 
       es.addEventListener("node:start", (ev) => {
@@ -234,17 +400,32 @@ export default function Home() {
         patchNodeSingle(d.nodeId, { status: "cancelled" });
       });
 
-      es.addEventListener("run:done", () => {
+      es.addEventListener("run:done", (ev) => {
+        const d = JSON.parse((ev as MessageEvent).data) as {
+          report: RunReport | null;
+        };
         setRunStatus((prev) => (prev === "aborted" ? prev : "completed"));
+        setReport(d.report);
+        es.close();
       });
 
       es.addEventListener("run:failed", (ev) => {
-        const d = JSON.parse((ev as MessageEvent).data) as { message: string };
+        const d = JSON.parse((ev as MessageEvent).data) as {
+          message: string;
+          report: RunReport | null;
+        };
         setRunStatus("failed");
         setNotice(d.message);
+        setReport(d.report);
+        es.close();
       });
 
-      es.onerror = () => {};
+      es.onerror = () => {
+        // EventSource 自带重连，服务端重连后立刻补发全量快照，这里只做可见提示
+        if (es.readyState !== EventSource.CLOSED) {
+          setReconnectNotice("连接中断，正在重连…");
+        }
+      };
     },
     [patchNodeSingle, expandNode],
   );
@@ -257,15 +438,21 @@ export default function Home() {
       esRef.current = es;
 
       es.addEventListener("snapshot", (ev) => {
-        const data = JSON.parse((ev as MessageEvent).data) as {
-          status: RunStatus;
-          nodes: Record<NodeId, AgentNodeState>;
-        };
+        // 断线重连后服务端补发全量快照；如果 run 已经结束，这里必须直接收尾，
+        // 否则错过 run:done 会让整个批量队列永远卡住
+        const snap = JSON.parse((ev as MessageEvent).data) as RunSnapshot;
         setTasks((prev) =>
           prev.map((t, idx) =>
-            idx === taskIndex ? { ...t, nodes: data.nodes, status: data.status } : t,
+            idx === taskIndex
+              ? { ...t, nodes: snap.nodes, status: snap.status, report: snap.report }
+              : t,
           ),
         );
+        setReconnectNotice("");
+        if (snap.status !== "running") {
+          es.close();
+          resolve();
+        }
       });
 
       es.addEventListener("node:start", (ev) => {
@@ -332,27 +519,43 @@ export default function Home() {
         patchNodeTask(taskIndex, d.nodeId, { status: "cancelled" });
       });
 
-      es.addEventListener("run:done", () => {
+      es.addEventListener("run:done", (ev) => {
+        const d = JSON.parse((ev as MessageEvent).data) as {
+          report: RunReport | null;
+        };
         setTasks((prev) =>
           prev.map((t, idx) =>
-            idx === taskIndex ? { ...t, status: "completed" } : t,
+            idx === taskIndex
+              ? { ...t, status: "completed", report: d.report }
+              : t,
           ),
         );
+        es.close();
         resolve();
       });
 
       es.addEventListener("run:failed", (ev) => {
-        const d = JSON.parse((ev as MessageEvent).data) as { message: string };
+        const d = JSON.parse((ev as MessageEvent).data) as {
+          message: string;
+          report: RunReport | null;
+        };
         setTasks((prev) =>
           prev.map((t, idx) =>
-            idx === taskIndex ? { ...t, status: "failed" } : t,
+            idx === taskIndex
+              ? { ...t, status: "failed", report: d.report }
+              : t,
           ),
         );
         setNotice(d.message);
+        es.close();
         resolve();
       });
 
-      es.onerror = () => {};
+      es.onerror = () => {
+        if (es.readyState !== EventSource.CLOSED) {
+          setReconnectNotice("连接中断，正在重连…");
+        }
+      };
     });
   }
 
@@ -364,6 +567,8 @@ export default function Home() {
     setNodes(emptyNodes());
     setRunStatus("running");
     setNotice("");
+    setReport(null);
+    setReconnectNotice("");
     setCopied({});
     setExpanded({});
     try {
@@ -416,6 +621,7 @@ export default function Home() {
     setTasks(initial);
     setActiveTaskIndex(0);
     setNotice("");
+    setReconnectNotice("");
     setCopied({});
     setExpanded({});
     batchRunningRef.current = true;
@@ -500,11 +706,15 @@ export default function Home() {
     // 重跑后重新连接 SSE
     if (mode === "single") {
       setRunStatus("running");
+      // 重跑会让服务端作废旧报告，前端同步清空
+      setReport(null);
       connectSingle(currentRunId);
     } else {
       const idx = activeTaskIndex;
       setTasks((prev) =>
-        prev.map((t, i) => (i === idx ? { ...t, status: "running" } : t)),
+        prev.map((t, i) =>
+          i === idx ? { ...t, status: "running", report: null } : t,
+        ),
       );
       connectTask(currentRunId, idx);
     }
@@ -734,6 +944,9 @@ export default function Home() {
           <span className="text-xs text-neutral-400">runId: {currentRunId.slice(0, 8)}</span>
         )}
         {notice && <span className="text-red-600">{notice}</span>}
+        {reconnectNotice && (
+          <span className="text-amber-600">{reconnectNotice}</span>
+        )}
         <button
           onClick={toggleAll}
           className="ml-auto rounded-md border border-neutral-300 bg-white px-2.5 py-1 text-xs"
@@ -846,6 +1059,28 @@ export default function Home() {
 
               <p className="text-xs text-neutral-500">{NODE_META[nodeId].desc}</p>
 
+              {/* 执行指标：耗时 / token / 重试，折叠态也展示 */}
+              {node.metrics && (
+                <div className="flex flex-wrap items-center gap-1.5 text-[11px]">
+                  <span className="rounded bg-white/70 px-1.5 py-0.5 text-neutral-600">
+                    {node.metrics.durationMs !== undefined
+                      ? formatDuration(node.metrics.durationMs)
+                      : "计时中"}
+                  </span>
+                  {node.metrics.usage && (
+                    <span className="rounded bg-white/70 px-1.5 py-0.5 text-neutral-600">
+                      {formatTokens(node.metrics.usage.totalTokens)} tokens
+                      {node.metrics.usageEstimated ? "（估算）" : ""}
+                    </span>
+                  )}
+                  {node.metrics.retries > 0 && (
+                    <span className="rounded bg-amber-100 px-1.5 py-0.5 text-amber-700">
+                      重试 {node.metrics.retries} 次
+                    </span>
+                  )}
+                </div>
+              )}
+
               {node.error && (
                 <p className="rounded-md bg-red-100 px-2 py-1 text-xs text-red-700">
                   {node.error}
@@ -951,6 +1186,25 @@ export default function Home() {
           );
         })}
       </div>
+
+      {/* 执行报告：单次模式看整条流水线，批量模式看当前选中任务 */}
+      {currentReport && (
+        <ReportCard
+          report={currentReport}
+          title={
+            mode === "single"
+              ? "本次流水线执行报告"
+              : `${tasks[activeTaskIndex]?.label ?? ""} 执行报告`
+          }
+        />
+      )}
+
+      {/* 批量任务全部结束后给出横向汇总 */}
+      {mode !== "single" &&
+        batchTotal > 1 &&
+        tasks.every((t) => t.status !== "running" && t.status !== "pending") && (
+          <BatchSummary tasks={tasks} />
+        )}
     </main>
   );
 }
