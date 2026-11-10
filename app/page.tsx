@@ -81,6 +81,7 @@ export default function Home() {
   const [runStatus, setRunStatus] = useState<RunStatus | "idle">("idle");
   const [runId, setRunId] = useState<string | null>(null);
   const [notice, setNotice] = useState("");
+  const [copied, setCopied] = useState<Partial<Record<NodeId, boolean>>>({});
   const esRef = useRef<EventSource | null>(null);
 
   // 卸载时关闭 SSE
@@ -186,6 +187,7 @@ export default function Home() {
     setNodes(emptyNodes());
     setRunStatus("running");
     setNotice("");
+    setCopied({});
 
     try {
       const res = await fetch("/api/run", {
@@ -230,6 +232,50 @@ export default function Home() {
       return;
     }
     setRunStatus("running");
+    setCopied((prev) => {
+      const next = { ...prev };
+      delete next[nodeId];
+      return next;
+    });
+  }
+
+  async function handleCopy(nodeId: NodeId) {
+    const text = nodes[nodeId].content;
+    if (!text || copied[nodeId]) return;
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopied((prev) => ({ ...prev, [nodeId]: true }));
+    } catch {
+      setNotice("复制失败，请手动选择文本复制");
+    }
+  }
+
+  function handleDownloadImage() {
+    const url = nodes.image.imageUrl;
+    if (!url) return;
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `${topic || "image"}.png`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+  }
+
+  function handleExportAll() {
+    const lf = nodes.longform.content;
+    const sc = nodes.script.content;
+    const xhs = nodes.xhs.content;
+    const img = nodes.image.imageUrl || "";
+    const md = `# 选题：${topic}\n\n## 公众号长文\n\n${lf}\n\n## 短视频脚本\n\n${sc}\n\n## 小红书笔记\n\n${xhs}\n\n## 配图\n\n![配图](${img})\n`;
+    const blob = new Blob([md], { type: "text/markdown;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `${topic || "content"}.md`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
   }
 
   const running = runStatus === "running";
@@ -266,6 +312,13 @@ export default function Home() {
           className="rounded-lg border border-neutral-300 px-5 py-2.5 text-sm font-medium disabled:opacity-40"
         >
           全部中断
+        </button>
+        <button
+          onClick={handleExportAll}
+          disabled={runStatus !== "completed"}
+          className="rounded-lg bg-emerald-600 px-5 py-2.5 text-sm font-medium text-white disabled:opacity-40"
+        >
+          导出全部
         </button>
       </div>
 
@@ -340,6 +393,19 @@ export default function Home() {
                     重跑
                   </button>
                 )}
+                {!isPlanner && nodeId !== "image" && node.status === "completed" && (
+                  <button
+                    onClick={() => handleCopy(nodeId)}
+                    disabled={!!copied[nodeId]}
+                    className={`rounded-md border px-2.5 py-1 text-xs ${
+                      copied[nodeId]
+                        ? "border-neutral-200 bg-neutral-100 text-neutral-400"
+                        : "border-neutral-300 bg-white"
+                    }`}
+                  >
+                    {copied[nodeId] ? "已复制" : "复制"}
+                  </button>
+                )}
               </div>
 
               {node.error && (
@@ -349,13 +415,30 @@ export default function Home() {
               )}
 
               {nodeId === "image" && node.imageUrl && (
-                // eslint-disable-next-line @next/next/no-img-element
-                <img
-                  src={node.imageUrl}
-                  alt="配图结果"
-                  className="w-full rounded-lg border border-neutral-200 object-cover"
-                />
+                <>
+                  {/* eslint-disable-next-line @next/next/no-img-element */}
+                  <img
+                    src={node.imageUrl}
+                    alt="配图结果"
+                    className="w-full rounded-lg border border-neutral-200 object-cover"
+                  />
+                  <button
+                    onClick={handleDownloadImage}
+                    className="self-start rounded-md border border-neutral-300 bg-white px-2.5 py-1 text-xs"
+                  >
+                    下载图片
+                  </button>
+                </>
               )}
+
+              {nodeId === "image" &&
+                node.status === "running" &&
+                !node.imageUrl &&
+                node.content && (
+                  <p className="rounded-md bg-blue-100 px-2 py-1 text-xs text-blue-700">
+                    提示词已生成，正在调用 Seedream 出图…
+                  </p>
+                )}
 
               <pre
                 className={`overflow-auto whitespace-pre-wrap break-words rounded-lg bg-white/70 p-3 text-xs leading-relaxed text-neutral-700 ${
