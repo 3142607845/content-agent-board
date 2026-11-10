@@ -85,19 +85,53 @@
 
 **4. SSE 事件协议**
 
-所有事件都按 `event: <名称>` + `data: <JSON>` 推送，完整清单：
+所有事件都按 `id: <自增序号>` + `event: <名称>` + `data: <JSON>` 推送。完整清单：
 
 | 事件 | 时机 | data 结构 |
 |---|---|---|
-| `snapshot` | 连接建立时先推一次 | `{ status, nodes }`，nodes 含每个节点当前状态和已累积内容 |
-| `node:start` | 节点开始（策划自动重试会再发一次） | `{ nodeId, name, model, attempt }` |
+| `snapshot` | 连接建立时（含断线重连）先推一次全量 | 见下方「全量快照」 |
+| `node:start` | 节点开始（自动重试会再发一次，attempt 递增） | `{ nodeId, name, model, attempt }` |
 | `node:token` | 收到一个 token | `{ nodeId, text }` |
 | `node:image` | 配图出图成功 | `{ nodeId, url, prompt }` |
 | `node:done` | 节点完成 | `{ nodeId }` |
 | `node:error` | 节点失败 | `{ nodeId, message }` |
 | `node:cancelled` | 节点被中断 | `{ nodeId }` |
-| `run:done` | 整条流水线结束 | `{ summary }` |
-| `run:failed` | 策划失败导致流水线终止 | `{ message }` |
+| `run:done` | 流水线结束（含中断收尾） | `{ summary, report }` |
+| `run:failed` | 策划失败导致流水线终止 | `{ message, summary, report }` |
+
+另外每 15 秒推送一行 SSE 注释 `: ping <时间戳>` 做保活，防止反向代理按空闲时间切断长连接；注释行不产生业务事件。
+
+**全量快照**
+
+`snapshot` 是唯一能让前端收敛状态的事件，结构：
+
+```ts
+{
+  runId: string;
+  topic: string;
+  variant: "analysis" | "story" | "beginner" | null;
+  status: "running" | "completed" | "failed" | "aborted";
+  createdAt: number;
+  finishedAt: number | null;
+  nodes: Record<NodeId, AgentNodeState>; // 含 content / imageUrl / error / attempt / model / metrics
+  summary: RunSummary | null;            // 终态才有值
+  report: RunReport | null;              // 终态才有值
+}
+```
+
+**断线重连策略**
+
+浏览器 `EventSource` 自动重连，服务端在每次连接建立时立即下发全量快照。
+
+- 节点已累积内容、耗时、token 用量全在快照里，重连后整体替换，不丢状态
+- 终态写回 `RunState`，连到已经结束的 run 也能立刻拿到 `summary` 与 `report`
+- **不做事件重放**：全量快照已能收敛状态，再维护事件日志表属于过度设计
+- 事件带自增 `id` 仅用于排查时序，服务端不处理 `Last-Event-ID`
+
+前端据此做了两处必要处理：
+
+1. 快照 `status !== "running"` 时直接结束当前任务。批量模式原来只等 `run:done` 才 resolve，断线期间 run 结束会让整个队列永久卡住，这是本轮修掉的真实 bug
+2. `onerror` 时显示「连接中断，正在重连」，收到新快照自动清除
 
 策划节点失败时推送：
 
@@ -107,6 +141,30 @@ data: {"nodeId":"planner","message":"JSON 解析失败（已重试1次）"}
 ```
 
 随后推送 `run:failed`，前端提示「策划提纲生成失败，无法继续生成内容」。
+
+**5. 执行日志与报告**
+
+每个节点在 `AgentNodeState.metrics` 上记录执行指标：
+
+| 字段 | 含义 |
+|---|---|
+| `startedAt` / `endedAt` / `durationMs` | 首次开始到最终结束的总耗时，策划重试不重置起点 |
+| `usage` | 该节点所有尝试累加后的 token 用量，含 prompt / completion / reasoning / cached |
+| `usageEstimated` | true 表示服务端未返回 usage，按字符估算 |
+| `retries` | 自动重试次数 = 尝试次数 - 1 |
+
+token 来源：请求体带 `stream_options: { include_usage: true }`，方舟在流末尾补一片 usage。中间分片的该字段是 `null`，且解析必须放在 `choices` 判空之前，否则会漏掉。`completionTokens` **包含思维链 token**，所以「输出 token」可能远大于正文字数，报告里单独列出 `reasoningTokens` 说明差异。
+
+流水线进入终态时由 `buildRunReport` 生成 `RunReport`，写回 `RunState.report` 并随 `run:done` 下发；也可以 `GET /api/run/[runId]` 一次性取全量快照与报告。
+
+报告内容：
+
+- 节点明细：模型、状态、尝试次数、耗时、输入/输出 token、重试次数
+- 汇总：模型调用次数、token 合计、失败与中断数
+- 并行加速比：4 个后置节点耗时之和 ÷ 并行阶段实际墙钟时间
+- `hasEstimated`：任一节点用了估算值就置 true，前端明确标注
+
+自动重试已下沉到 4 个后置节点：仅对网络异常、408、429、5xx 重试，`AbortError` 与其他 4xx 不重试。
 
 ## 模型分工（差异化）
 
@@ -175,7 +233,8 @@ page.tsx (variant)
 │ POST /api/run            启动流水线，返回 runId        │
 │ POST /api/stop/:runId    中断全部；?nodeId= 单节点中断 │
 │ POST /api/rerun/:nodeId  重跑单个节点                  │
-│ GET  /api/stream/:runId  SSE 推送状态+内容             │
+│ GET  /api/stream/:runId  SSE：全量快照 + 增量事件       │
+│ GET  /api/run/:runId     一次性取快照与执行报告          │
 └──────────────────────┬──────────────────────────────┘
                        ▼
 ┌─────────────────────────────────────────────────────┐
@@ -185,6 +244,7 @@ page.tsx (variant)
 │   2. 策划完成后，并行启动 4 个内容 Agent                │
 │   3. 每个 Agent 流式推送内容到前端                      │
 │   4. 支持中断（AbortController）和单节点重跑            │
+│   5. 节点级指标采集 + 终态生成执行报告                  │
 └──────────────────────┬──────────────────────────────┘
                        ▼
 ┌─────────────────────────────────────────────────────┐
@@ -197,27 +257,31 @@ page.tsx (variant)
 ## 关键设计决策
 
 1. **编排引擎自研**：场景是固定的「策划 → 4 路并行」，不需要 LangGraph 的条件分支能力，自研状态机更轻量、更易讲解。
-2. **SSE 而非 WebSocket**：只需要后端向前端单向推送状态和内容，SSE 足够且更简单。需处理断连重连和 Last-Event-ID。
+2. **SSE 而非 WebSocket**：只需要后端向前端单向推送状态和内容，SSE 足够且更简单。断连重连用「全量快照收敛」而不是事件重放：服务端在每次连接建立时下发 snapshot，终态写回 `RunState`，所以连到已结束的 run 也能立刻拿到 summary 和 report；事件带自增 id 仅用于排查时序，不处理 `Last-Event-ID`。
 3. **看板用卡片网格，不用节点画布**：曾尝试 React Flow 做节点画布，实测否决——4 个内容节点摆成 2×2 会暗示「长文 → 脚本 → 小红书 → 配图」的先后顺序，而它们实际完全并行，布局在误导架构；拖拽时画布平移还会抢走节点拖拽事件。改为「策划卡整行 + 4 张内容卡一行四列」，同样表达 1 上游 + 4 并行，且更省空间。
 4. **结果卡片默认折叠，运行时自动展开**：默认折叠让看板紧凑，但节点开始运行时必须自动展开——否则 4 个 Agent 并行流式吐字这个核心能力在界面上看不见。展开态内容区固定 `max-h` + `overflow-auto`，滚动限制在卡片内，不让页面高度暴涨。
 5. **中断逻辑**：每个 Node 单独持有独立的 AbortController，不共用全局 signal；abort 只切断 LLM 流式请求，不清空 node.content。具体规则：
    - **全局中断（策划阶段）**：策划节点停止生成，已输出内容保留并标记为 `cancelled`；4 个后置节点状态标记为 `cancelled`，不再启动。
    - **全局中断（并行阶段）**：策划节点已完成保持不动；已完成的节点内容保留不动；正在流式输出的节点立刻停止拉取新 token、已生成文字保留；还没启动的 pending 节点标记为 cancelled，不再启动。
    - **单节点中断**：仅指定节点停止生成、已有内容保留；策划及其他所有节点不受影响，正常跑、内容保留；其他 pending 节点继续正常调度执行。
+6. **执行报告跟 run 一起走，不落盘**：报告由 `buildRunReport` 在内存中生成，写回 `RunState.report`，随 `run:done` 下发并可通过 `GET /api/run/[runId]` 取。不写本地 JSON 文件——会污染仓库，且 Vercel 只读环境写不了。报告里刻意保留 `hasEstimated` 标记：服务端没返回 usage 时宁可标注「估算」，也不把估算值当真实值展示。
+7. **并行加速比作为架构价值的量化指标**：报告不只列各节点耗时，还计算「4 路串行耗时之和 ÷ 实际墙钟时间」。这是唯一能用一个数字说明「多 Agent 并行」比单线程串行快多少的地方。
 
 ## 模块职责
 
 | 模块 | 文件 | 职责 |
 |---|---|---|
-| 看板页面 | app/page.tsx | 三种模式、卡片网格、SSE 接入、折叠/进度条、导出 |
+| 看板页面 | app/page.tsx | 三种模式、卡片网格、SSE 接入与重连、折叠/进度条、导出、执行报告展示 |
 | 创作维度定义 | lib/variants.ts | 三个变体的名称、定位、结构骨架（纯数据，前后端共用） |
 | 启动接口 | app/api/run/route.ts | 创建 run（可选 variant），启动编排 |
-| 流接口 | app/api/stream/[runId]/route.ts | SSE 推送 |
+| 流接口 | app/api/stream/[runId]/route.ts | SSE：连接即下发全量快照，之后推增量事件，15s 心跳保活 |
+| 快照接口 | app/api/run/[runId]/route.ts | 一次性返回全量快照与执行报告，供调试和演示 |
 | 中断接口 | app/api/stop/[runId]/route.ts | 中断全部；带 nodeId 则只中断指定节点 |
 | 重跑接口 | app/api/rerun/[nodeId]/route.ts | 重跑单节点 |
-| 编排引擎 | lib/orchestrator.ts | 状态机、并行调度、中断/重跑 |
-| Agent 基类 | lib/agents/base.ts | 模型调用、流式、AbortSignal |
+| 编排引擎 | lib/orchestrator.ts | 状态机、并行调度、中断/重跑、节点指标采集、终态收尾 |
+| 执行报告 | lib/report.ts | 报告模型与生成逻辑（耗时、token、重试、并行加速比），纯函数无副作用 |
+| Agent 基类 | lib/agents/base.ts | 模型调用、流式、AbortSignal、usage 回调透传 |
 | 各 Agent | lib/agents/*.ts | 各自 prompt + 模型配置 |
-| 模型封装 | lib/llm.ts | 统一 API 调用 |
+| 模型封装 | lib/llm.ts | 统一 API 调用，解析 usage |
 | 图像封装 | lib/image.ts | 文生图接口调用（Seedream），返回 base64 后落地到 `public/generated/` |
 | 图片存储 | public/generated/ | 出图产物本地持久化，前端以 `/generated/xxx.png` 引用（仅本地可用，Vercel 只读环境不可写） |
