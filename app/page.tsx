@@ -14,48 +14,79 @@ import type { HistoryBatch, HistoryRunEntry } from "@/lib/history";
 
 const NODE_ORDER: NodeId[] = ["planner", "longform", "script", "xhs", "image"];
 
-const NODE_META: Record<NodeId, { name: string; desc: string }> = {
-  planner: { name: "策划 Agent", desc: "拆解选题，产出四渠道提纲 JSON" },
-  longform: { name: "公众号长文", desc: "公众号长文，2000 字以上" },
-  script: { name: "短视频脚本", desc: "短视频分镜脚本" },
-  xhs: { name: "小红书笔记", desc: "小红书笔记正文与标签" },
-  image: { name: "配图 Agent", desc: "扩写提示词并调用 Seedream 出图" },
+const NODE_META: Record<
+  NodeId,
+  { name: string; desc: string; glyph: string; tint: string }
+> = {
+  planner: {
+    name: "策划 Agent",
+    desc: "拆解选题，产出四渠道提纲 JSON",
+    glyph: "策",
+    tint: "bg-indigo-50 text-indigo-600 ring-indigo-100",
+  },
+  longform: {
+    name: "公众号长文",
+    desc: "公众号长文，2000 字以上",
+    glyph: "文",
+    tint: "bg-sky-50 text-sky-600 ring-sky-100",
+  },
+  script: {
+    name: "短视频脚本",
+    desc: "短视频分镜脚本",
+    glyph: "稿",
+    tint: "bg-violet-50 text-violet-600 ring-violet-100",
+  },
+  xhs: {
+    name: "小红书笔记",
+    desc: "小红书笔记正文与标签",
+    glyph: "红",
+    tint: "bg-rose-50 text-rose-600 ring-rose-100",
+  },
+  image: {
+    name: "配图 Agent",
+    desc: "扩写提示词并调用 Seedream 出图",
+    glyph: "图",
+    tint: "bg-amber-50 text-amber-600 ring-amber-100",
+  },
 };
 
-/** 状态只体现在左色条、圆点和小徽标上，卡片底始终中性，避免多卡同时变绿变蓝 */
+/** 首页插图：AI 生成的内容流水线示意图，加载失败时退回纯色块不影响布局 */
+const HERO_IMAGE =
+  "https://trae-api-cn.mchost.guru/api/ide/v1/text_to_image?prompt=" +
+  encodeURIComponent(
+    "soft 3D isometric illustration of a content production pipeline, five floating rounded white cards connected by glowing indigo and violet lines, abstract minimal, clean light background, subtle shadows, high quality render",
+  ) +
+  "&image_size=landscape_4_3";
+
+/** 状态只体现在左色条和小徽标上，卡片底始终中性，避免多卡同时变绿变蓝 */
 const STATUS_STYLE: Record<
   NodeStatus,
-  { label: string; bar: string; badge: string; dot: string }
+  { label: string; bar: string; badge: string }
 > = {
   pending: {
     label: "等待",
     bar: "bg-neutral-200",
     badge: "bg-neutral-100 text-neutral-500",
-    dot: "bg-neutral-300",
   },
   running: {
     label: "生成中",
     bar: "bg-blue-500",
     badge: "bg-blue-50 text-blue-700",
-    dot: "bg-blue-500 animate-pulse",
   },
   completed: {
     label: "完成",
     bar: "bg-emerald-500",
     badge: "bg-emerald-50 text-emerald-700",
-    dot: "bg-emerald-500",
   },
   failed: {
     label: "失败",
     bar: "bg-red-500",
     badge: "bg-red-50 text-red-700",
-    dot: "bg-red-500",
   },
   cancelled: {
     label: "已中断",
     bar: "bg-amber-500",
     badge: "bg-amber-50 text-amber-700",
-    dot: "bg-amber-500",
   },
 };
 
@@ -955,6 +986,51 @@ export default function Home() {
       </header>
 
       <main className="mx-auto flex w-full max-w-6xl flex-1 flex-col gap-5 px-6 py-6">
+      {/* 首屏说明区：产品定位 + 流水线示意图 */}
+      <section className="relative overflow-hidden rounded-2xl border border-hairline bg-surface shadow-card">
+        <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(36rem_20rem_at_100%_0%,#eef0ff_0%,transparent_70%)]" />
+        <div className="relative flex flex-col gap-6 p-6 md:flex-row md:items-center md:p-7">
+          <div className="flex-1">
+            <span className="inline-flex items-center rounded-full border border-indigo-100 bg-indigo-50/70 px-2.5 py-1 text-[11px] font-medium text-indigo-600">
+              多 Agent 协同 · 内容生产流水线
+            </span>
+            <h2 className="mt-3 text-xl font-semibold tracking-tight text-ink md:text-2xl">
+              一个选题，五个 Agent，四路产出
+            </h2>
+            <p className="mt-2 max-w-xl text-sm leading-relaxed text-ink-2">
+              策划 Agent 先把选题拆成结构化提纲，长文、脚本、小红书、配图并行开工；
+              每个节点的耗时、token 与重试都会记进执行报告，历史批次随时可回看。
+            </p>
+            <div className="mt-4 flex flex-wrap gap-2">
+              {["5 个 Agent 节点", "4 路并行生成", "全过程可回看"].map(
+                (item) => (
+                  <span
+                    key={item}
+                    className="rounded-md border border-hairline bg-canvas px-2 py-1 text-[11px] text-ink-2"
+                  >
+                    {item}
+                  </span>
+                ),
+              )}
+            </div>
+          </div>
+
+          <div className="hidden w-[300px] shrink-0 md:block">
+            <div className="overflow-hidden rounded-xl border border-hairline bg-gradient-to-br from-indigo-50 via-white to-violet-50">
+              {/* eslint-disable-next-line @next/next/no-img-element */}
+              <img
+                src={HERO_IMAGE}
+                alt="多 Agent 内容流水线示意图"
+                className="h-[168px] w-full object-cover"
+                onError={(e) => {
+                  e.currentTarget.style.display = "none";
+                }}
+              />
+            </div>
+          </div>
+        </div>
+      </section>
+
       {/* 历史批次列表：按批次聚合，点某个版本进入只读回看 */}
       {historyOpen && (
         <section className={`${CARD} flex flex-col gap-3 p-4`}>
@@ -1057,6 +1133,12 @@ export default function Home() {
       )}
 
       {/* 运行控制台：模式切换 + 输入 + 动作收进一张卡，按钮按权重分主次 */}
+      <div className="flex items-baseline gap-2">
+        <span className="font-mono text-[11px] tabular-nums text-ink-3">01</span>
+        <h2 className="text-sm font-semibold text-ink">运行控制台</h2>
+        <span className="text-xs text-ink-3">选择模式、输入选题、启动流水线</span>
+      </div>
+
       <section className={`${CARD} overflow-hidden`}>
         <div className="flex gap-1 border-b border-hairline bg-canvas/70 p-2">
           {MODE_TABS.map((tab) => (
@@ -1258,6 +1340,7 @@ export default function Home() {
       {/* 执行监视 */}
       <div className="mt-1 flex flex-wrap items-center justify-between gap-2">
         <div className="flex items-baseline gap-2">
+          <span className="font-mono text-[11px] tabular-nums text-ink-3">02</span>
           <h2 className="text-sm font-semibold text-ink">执行监视</h2>
           <span className="text-xs text-ink-3">5 个 Agent 节点</span>
         </div>
@@ -1285,7 +1368,7 @@ export default function Home() {
           return (
             <section
               key={nodeId}
-              className={`relative flex flex-col gap-3 overflow-hidden rounded-xl border border-hairline bg-surface p-4 shadow-card ${
+              className={`relative flex flex-col gap-3 overflow-hidden rounded-xl border border-hairline bg-surface p-4 shadow-card transition duration-200 hover:-translate-y-0.5 hover:shadow-pop ${
                 isPlanner ? "md:col-span-2 xl:col-span-4" : ""
               }`}
             >
@@ -1299,8 +1382,12 @@ export default function Home() {
                 onClick={() => toggleNode(nodeId)}
                 className="flex w-full items-start justify-between gap-2 text-left"
               >
-                <span className="flex items-center gap-2">
-                  <span className={`h-2 w-2 rounded-full ${style.dot}`} />
+                <span className="flex items-center gap-2.5">
+                  <span
+                    className={`grid h-8 w-8 shrink-0 place-items-center rounded-lg text-[13px] font-semibold ring-1 ${NODE_META[nodeId].tint}`}
+                  >
+                    {NODE_META[nodeId].glyph}
+                  </span>
                   <span className="text-sm font-semibold text-ink">
                     {NODE_META[nodeId].name}
                   </span>
@@ -1447,6 +1534,15 @@ export default function Home() {
           );
         })}
       </div>
+
+      {/* 空态提示：还没跑过任何任务时告诉用户下一步做什么 */}
+      {!isRunning &&
+        !reviewing &&
+        currentNodes.planner.status === "pending" && (
+          <p className="text-center text-xs text-ink-3">
+            在上面输入一个选题并点击「开始生成」，五个 Agent 会依次亮起
+          </p>
+        )}
 
       {/* 执行报告：单次模式看整条流水线，批量模式看当前选中任务 */}
       {currentReport && (

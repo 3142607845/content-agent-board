@@ -34,7 +34,14 @@
 
 /* Geist 只含拉丁字形，中文回落到系统字体；主题固定浅色，不再跟随系统深色 */
 body {
-  background: var(--canvas);
+  background-color: var(--canvas);
+  /* 细点阵 + 两团冷光，让纯灰底有材质而不是一片死板 */
+  background-image:
+    radial-gradient(circle at 1px 1px, rgba(20, 22, 26, 0.045) 1px, transparent 0),
+    radial-gradient(52rem 34rem at 8% -14%, #e8ecfd 0%, transparent 60%),
+    radial-gradient(44rem 30rem at 102% -6%, #eae7fb 0%, transparent 58%);
+  background-size: 24px 24px, auto, auto;
+  background-attachment: fixed, fixed, fixed;
   color: var(--ink);
   font-family: var(--font-geist-sans), "PingFang SC", "Microsoft YaHei",
     system-ui, sans-serif;
