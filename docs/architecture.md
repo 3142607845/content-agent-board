@@ -215,6 +215,45 @@ page.tsx (variant)
 
 约束：**差异化必须落在结构骨架上**（段落推进步骤、论据类型、配图风格），只换形容词模型仍会输出同质提纲。下游 4 个 Agent 不额外感知变体，提纲已携带角度与结构。`variant` 为可选参数，不传时行为与单次模式一致；`rerunNode` 复用 `run.outline`，变体信息天然保留。
 
+## 历史任务回看
+
+流水线到达终态后，整份 `RunSnapshot` 落盘到 `data/runs/{runId}.json`，进程重启后仍可完整回看。
+
+**批次模型**
+
+- 多版模式一次点击创建的 3 个 run 共用同一个 `batchId`（前端生成）；单次模式的 `batchId` 等于 `runId`
+- `GET /api/history` 读目录、按 `batchId` 聚合，按批次创建时间倒序返回最近 5 个批次
+- 超出时整批淘汰，不会出现同一批次只剩部分版本
+
+**为什么不用 localStorage**
+
+前端存 runId 只能救「刷新页面」，救不了「进程重启」——`globalThis` 上的 Map 会清空。实际使用中主要场景恰恰是隔天再打开，所以必须服务端落盘。
+
+**只记终态**
+
+| 状态 | 是否落盘 | 原因 |
+|---|---|---|
+| `completed` / `failed` | 是 | 完整产出或完整失败报告都有复盘价值 |
+| `aborted` | 否 | 内容不完整，进历史会误导 |
+| `running` | 否 | 尚未收敛 |
+
+**接口**
+
+| 接口 | 说明 |
+|---|---|
+| `GET /api/history` | 最近 5 个批次的回看摘要（批次 → 版本列表） |
+| `GET /api/run/[runId]` | 先查内存，未命中回退读 `data/runs/`，返回结构不变 |
+
+**前端回看态**
+
+点击历史版本后回填结果区，顶部显示「历史回看」横幅；隐藏单节点重跑入口，不建立 SSE 连接。点「退出回看」或切换模式恢复到空态。
+
+**边界**
+
+- 写盘失败只 `console.error`，不影响流水线结果
+- 部署到 Vercel 等只读环境时该功能自动降级为不可用
+- 落盘内容是完整文本，单条约 10–40 KB，5 批上限下磁盘占用可忽略
+
 ## 技术架构
 
 ```
@@ -264,8 +303,9 @@ page.tsx (variant)
    - **全局中断（策划阶段）**：策划节点停止生成，已输出内容保留并标记为 `cancelled`；4 个后置节点状态标记为 `cancelled`，不再启动。
    - **全局中断（并行阶段）**：策划节点已完成保持不动；已完成的节点内容保留不动；正在流式输出的节点立刻停止拉取新 token、已生成文字保留；还没启动的 pending 节点标记为 cancelled，不再启动。
    - **单节点中断**：仅指定节点停止生成、已有内容保留；策划及其他所有节点不受影响，正常跑、内容保留；其他 pending 节点继续正常调度执行。
-6. **执行报告跟 run 一起走，不落盘**：报告由 `buildRunReport` 在内存中生成，写回 `RunState.report`，随 `run:done` 下发并可通过 `GET /api/run/[runId]` 取。不写本地 JSON 文件——会污染仓库，且 Vercel 只读环境写不了。报告里刻意保留 `hasEstimated` 标记：服务端没返回 usage 时宁可标注「估算」，也不把估算值当真实值展示。
+6. **执行报告随快照落盘**：报告由 `buildRunReport` 在内存中生成，写回 `RunState.report`，随 `run:done` 下发，并可通过 `GET /api/run/[runId]` 取。最初只在内存保留、不写文件；新增历史回看后改为随快照落到 `data/runs/`——内存态在进程重启后必然丢失，而「隔天打开看上一轮结果」正是回看的主要场景。该目录已加入 `.gitignore`，不污染仓库；写盘失败只记日志，不影响流水线。报告里刻意保留 `hasEstimated` 标记：服务端没返回 usage 时宁可标注「估算」，也不把估算值当真实值展示。
 7. **并行加速比作为架构价值的量化指标**：报告不只列各节点耗时，还计算「4 路串行耗时之和 ÷ 实际墙钟时间」。这是唯一能用一个数字说明「多 Agent 并行」比单线程串行快多少的地方。
+8. **历史记录按批次限流，而不是按 run**：多版模式一次点击产出的 3 个 run 属于同一个 `batchId`。若按 run 限 5 条，两批就把名额吃光；按批次限 5 个，回看时也正好是「一批 3 个版本」的对比单元。淘汰时整批删除，不会出现同批只剩一半版本。
 
 ## 模块职责
 
@@ -273,9 +313,10 @@ page.tsx (variant)
 |---|---|---|
 | 看板页面 | app/page.tsx | 三种模式、卡片网格、SSE 接入与重连、折叠/进度条、导出、执行报告展示 |
 | 创作维度定义 | lib/variants.ts | 三个变体的名称、定位、结构骨架（纯数据，前后端共用） |
-| 启动接口 | app/api/run/route.ts | 创建 run（可选 variant），启动编排 |
+| 启动接口 | app/api/run/route.ts | 创建 run（可选 variant / batchId），启动编排 |
 | 流接口 | app/api/stream/[runId]/route.ts | SSE：连接即下发全量快照，之后推增量事件，15s 心跳保活 |
-| 快照接口 | app/api/run/[runId]/route.ts | 一次性返回全量快照与执行报告，供调试和演示 |
+| 快照接口 | app/api/run/[runId]/route.ts | 一次性返回全量快照与执行报告；内存未命中时回退读落盘文件 |
+| 历史列表 | app/api/history/route.ts | 返回最近 5 个批次的回看摘要 |
 | 中断接口 | app/api/stop/[runId]/route.ts | 中断全部；带 nodeId 则只中断指定节点 |
 | 重跑接口 | app/api/rerun/[nodeId]/route.ts | 重跑单节点 |
 | 编排引擎 | lib/orchestrator.ts | 状态机、并行调度、中断/重跑、节点指标采集、终态收尾 |
@@ -285,3 +326,5 @@ page.tsx (variant)
 | 模型封装 | lib/llm.ts | 统一 API 调用，解析 usage |
 | 图像封装 | lib/image.ts | 文生图接口调用（Seedream），返回 base64 后落地到 `public/generated/` |
 | 图片存储 | public/generated/ | 出图产物本地持久化，前端以 `/generated/xxx.png` 引用（仅本地可用，Vercel 只读环境不可写） |
+| 历史快照 | lib/history.ts | 终态快照落盘、按批次聚合、保留最近 5 批并整批淘汰 |
+| 历史数据目录 | data/runs/ | 终态 run 的完整快照，已加入 `.gitignore` |
