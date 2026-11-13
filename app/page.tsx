@@ -10,6 +10,7 @@ import type {
 } from "@/lib/orchestrator";
 import { formatDuration, formatTokens, type RunReport } from "@/lib/report";
 import { VARIANTS, type VariantKey } from "@/lib/variants";
+import type { HistoryBatch, HistoryRunEntry } from "@/lib/history";
 
 const NODE_ORDER: NodeId[] = ["planner", "longform", "script", "xhs", "image"];
 
@@ -59,6 +60,13 @@ const RUN_STATUS_TEXT: Record<RunStatus, string> = {
   aborted: "已中断",
 };
 
+/** 历史列表用的短时间格式，避免 toLocaleString 在服务端/客户端输出不一致 */
+function formatTime(ts: number): string {
+  const d = new Date(ts);
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
 type Mode = "single" | "multi-topic" | "multi-version";
 
 const MODE_TABS: { id: Mode; label: string }[] = [
@@ -78,6 +86,13 @@ interface TaskResult {
   runId?: string;
   /** 该任务跑完后由服务端下发的执行报告 */
   report?: RunReport | null;
+}
+
+/** 历史回看态：只读展示落盘快照，不建立 SSE 连接 */
+interface ReviewingState {
+  runId: string;
+  variantName: string | null;
+  finishedAt: number | null;
 }
 
 function emptyNodes(): Record<NodeId, AgentNodeState> {
@@ -274,6 +289,27 @@ export default function Home() {
   const esRef = useRef<EventSource | null>(null);
   const batchRunningRef = useRef(false);
 
+  // 历史回看：批次列表来自服务端落盘快照，不依赖当前内存态
+  const [historyBatches, setHistoryBatches] = useState<HistoryBatch[]>([]);
+  const [historyOpen, setHistoryOpen] = useState(false);
+  const [reviewing, setReviewing] = useState<ReviewingState | null>(null);
+
+  const loadHistory = useCallback(async () => {
+    try {
+      const res = await fetch("/api/history", { cache: "no-store" });
+      if (!res.ok) return;
+      const data = (await res.json()) as { batches?: HistoryBatch[] };
+      setHistoryBatches(data.batches ?? []);
+    } catch {
+      // 历史列表取不到不影响主流程
+    }
+  }, []);
+
+  // 首次进入拉一次：刷新页面后历史入口仍然有内容
+  useEffect(() => {
+    void loadHistory();
+  }, [loadHistory]);
+
   useEffect(
     () => () => {
       esRef.current?.close();
@@ -406,6 +442,8 @@ export default function Home() {
         };
         setRunStatus((prev) => (prev === "aborted" ? prev : "completed"));
         setReport(d.report);
+        // run 已落盘，刷新历史列表
+        void loadHistory();
         es.close();
       });
 
@@ -417,6 +455,7 @@ export default function Home() {
         setRunStatus("failed");
         setNotice(d.message);
         setReport(d.report);
+        void loadHistory();
         es.close();
       });
 
@@ -427,7 +466,7 @@ export default function Home() {
         }
       };
     },
-    [patchNodeSingle, expandNode],
+    [patchNodeSingle, expandNode, loadHistory],
   );
 
   // 批量模式 SSE，返回 Promise 在 run 结束时 resolve
@@ -530,6 +569,8 @@ export default function Home() {
               : t,
           ),
         );
+        // 本批完成一个 run，历史列表同步刷新
+        void loadHistory();
         es.close();
         resolve();
       });
@@ -547,6 +588,7 @@ export default function Home() {
           ),
         );
         setNotice(d.message);
+        void loadHistory();
         es.close();
         resolve();
       });
@@ -564,6 +606,7 @@ export default function Home() {
     const value = topic.trim();
     if (!value) return;
     esRef.current?.close();
+    setReviewing(null);
     setNodes(emptyNodes());
     setRunStatus("running");
     setNotice("");
@@ -626,6 +669,9 @@ export default function Home() {
     setExpanded({});
     batchRunningRef.current = true;
 
+    // 同一批任务共享 batchId，历史回看时聚合为一个批次
+    const batchUuid = crypto.randomUUID();
+
     for (let i = 0; i < initial.length; i++) {
       if (!batchRunningRef.current) {
         setTasks((prev) =>
@@ -644,6 +690,7 @@ export default function Home() {
           body: JSON.stringify({
             topic: initial[i].topic,
             ...(initial[i].variant ? { variant: initial[i].variant } : {}),
+            batchId: batchUuid,
           }),
         });
         const data = (await res.json()) as { runId?: string; error?: string };
@@ -759,8 +806,49 @@ export default function Home() {
     URL.revokeObjectURL(url);
   }
 
+  // 打开一条历史任务：用落盘快照回填结果区，进入只读回看，不建立 SSE
+  async function openHistoryRun(entry: HistoryRunEntry) {
+    esRef.current?.close();
+    try {
+      const res = await fetch(`/api/run/${entry.runId}`, { cache: "no-store" });
+      if (!res.ok) throw new Error("历史快照已不存在");
+      const snap = (await res.json()) as RunSnapshot;
+      setMode("single");
+      setTopic(snap.topic);
+      setNodes(snap.nodes);
+      setRunStatus(snap.status);
+      setRunId(snap.runId);
+      setReport(snap.report);
+      setExpanded({});
+      setCopied({});
+      setNotice("");
+      setReconnectNotice("");
+      setReviewing({
+        runId: snap.runId,
+        variantName: entry.variantName,
+        finishedAt: snap.finishedAt,
+      });
+      setHistoryOpen(false);
+    } catch (err) {
+      setNotice(err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  function exitReview() {
+    setReviewing(null);
+    setRunId(null);
+    setNodes(emptyNodes());
+    setRunStatus("idle");
+    setReport(null);
+    setCopied({});
+    setExpanded({});
+    setNotice("");
+  }
+
   function switchMode(next: Mode) {
     if (isRunning) return;
+    // 回看态下切模式视为离开回看，避免历史内容与新模式的空态混在一起
+    if (reviewing) exitReview();
     setMode(next);
     setNotice("");
     setTasks([]);
@@ -797,12 +885,117 @@ export default function Home() {
 
   return (
     <main className="mx-auto flex w-full max-w-6xl flex-1 flex-col gap-6 px-6 py-10">
-      <header className="flex flex-col gap-2">
-        <h1 className="text-2xl font-semibold">Content Agent Board</h1>
-        <p className="text-sm text-neutral-500">
-          输入选题 → 策划 Agent 拆解提纲 → 长文 / 脚本 / 小红书 / 配图 四路并行
-        </p>
+      <header className="flex flex-wrap items-start justify-between gap-3">
+        <div className="flex flex-col gap-2">
+          <h1 className="text-2xl font-semibold">Content Agent Board</h1>
+          <p className="text-sm text-neutral-500">
+            输入选题 → 策划 Agent 拆解提纲 → 长文 / 脚本 / 小红书 / 配图 四路并行
+          </p>
+        </div>
+        <button
+          onClick={() => {
+            setHistoryOpen((prev) => !prev);
+            if (!historyOpen) void loadHistory();
+          }}
+          className="rounded-lg border border-neutral-300 bg-white px-3 py-2 text-sm font-medium text-neutral-700"
+        >
+          历史记录{historyBatches.length > 0 ? ` (${historyBatches.length})` : ""}
+        </button>
       </header>
+
+      {/* 历史批次列表：按批次聚合，点某个版本进入只读回看 */}
+      {historyOpen && (
+        <section className="flex flex-col gap-3 rounded-xl border border-neutral-200 bg-white p-4">
+          <div className="flex items-center justify-between">
+            <h2 className="text-sm font-semibold">最近 5 个批次</h2>
+            <button
+              onClick={() => void loadHistory()}
+              className="text-xs text-neutral-500 underline"
+            >
+              刷新
+            </button>
+          </div>
+          {historyBatches.length === 0 ? (
+            <p className="text-xs text-neutral-400">
+              暂无历史任务，跑完一次流水线后会自动保存。
+            </p>
+          ) : (
+            <ul className="flex flex-col gap-2">
+              {historyBatches.map((batch) => (
+                <li
+                  key={batch.batchId}
+                  className="rounded-lg border border-neutral-200"
+                >
+                  <div className="flex flex-wrap items-center gap-2 border-b border-neutral-100 px-3 py-2 text-xs">
+                    <span className="font-medium text-neutral-800">
+                      {batch.topic}
+                    </span>
+                    <span className="text-neutral-400">
+                      {formatTime(batch.createdAt)}
+                    </span>
+                    <span
+                      className={
+                        batch.status === "completed"
+                          ? "text-green-600"
+                          : batch.status === "partial"
+                            ? "text-amber-600"
+                            : "text-red-600"
+                      }
+                    >
+                      {batch.status === "completed"
+                        ? "全部完成"
+                        : batch.status === "partial"
+                          ? "部分失败"
+                          : "全部失败"}
+                    </span>
+                    <span className="text-neutral-400">
+                      {batch.runs.length} 个版本
+                    </span>
+                  </div>
+                  <div className="flex flex-wrap gap-2 px-3 py-2">
+                    {batch.runs.map((run) => (
+                      <button
+                        key={run.runId}
+                        onClick={() => void openHistoryRun(run)}
+                        className={`rounded-md border px-2.5 py-1 text-xs ${
+                          reviewing?.runId === run.runId
+                            ? "border-neutral-900 bg-neutral-900 text-white"
+                            : "border-neutral-300 text-neutral-700"
+                        }`}
+                      >
+                        {run.variantName ?? "单次生成"}
+                        {run.durationMs !== null
+                          ? ` · ${formatDuration(run.durationMs)}`
+                          : ""}
+                      </button>
+                    ))}
+                  </div>
+                </li>
+              ))}
+            </ul>
+          )}
+        </section>
+      )}
+
+      {/* 回看态提示：只读展示，不建立 SSE */}
+      {reviewing && (
+        <div className="flex flex-wrap items-center gap-3 rounded-lg border border-blue-200 bg-blue-50 px-4 py-2.5 text-sm">
+          <span className="font-medium text-blue-800">历史回看</span>
+          <span className="text-blue-700">
+            {reviewing.variantName ? `${reviewing.variantName} · ` : ""}
+            {reviewing.finishedAt ? formatTime(reviewing.finishedAt) : ""}
+          </span>
+          <span className="text-xs text-blue-600">
+            只读快照，没有实时流；重新生成会创建新任务
+          </span>
+          <button
+            onClick={exitReview}
+            className="ml-auto rounded-md border border-blue-300 bg-white px-2.5 py-1 text-xs text-blue-700"
+          >
+            退出回看
+          </button>
+        </div>
+      )}
 
       {/* 模式切换 */}
       <div className="flex gap-1 rounded-lg bg-neutral-100 p-1">
@@ -1025,6 +1218,7 @@ export default function Home() {
           const canStop = node.status === "running" || node.status === "pending";
           const canRerun =
             !isPlanner &&
+            !reviewing &&
             currentNodes.planner.status === "completed" &&
             (node.status === "failed" ||
               node.status === "cancelled" ||
