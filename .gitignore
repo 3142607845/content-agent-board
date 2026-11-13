@@ -35,3 +35,6 @@ next-env.d.ts
 
 # 运行时生成的配图
 public/generated/
+
+# 运行时落盘的历史任务快照
+data/runs/

@@ -6,6 +6,7 @@ import { ImageAgent } from "./agents/image";
 import type { VariantKey } from "./variants";
 import type { TokenUsage } from "./llm";
 import { addUsage, buildRunReport, estimateTokens, type RunReport } from "./report";
+import { saveRunSnapshot } from "./history";
 
 /**
  * 编排引擎
@@ -106,6 +107,8 @@ export interface RunState {
   topic: string;
   /** 多版模式的创作维度；单次模式不传，策划按通用提纲生成 */
   variant: VariantKey | null;
+  /** 批次标识：多版模式一次点击产生的多个 run 共享同一批次，用于历史分组 */
+  batchId: string;
   status: RunStatus;
   nodes: Record<NodeId, AgentNodeState>;
   /** 策划解析成功后的提纲对象，单节点重跑时复用 */
@@ -176,11 +179,17 @@ function emit(run: RunState, event: StreamEvent) {
 }
 
 /** 创建一次运行，不启动，由调用方决定何时 startRun */
-export function createRun(topic: string, variant?: VariantKey): RunState {
+export function createRun(
+  topic: string,
+  variant?: VariantKey,
+  batchId?: string,
+): RunState {
+  const id = crypto.randomUUID();
   const run: RunState = {
-    id: crypto.randomUUID(),
+    id,
     topic,
     variant: variant ?? null,
+    batchId: batchId ?? id,
     status: "running",
     nodes: initNodes(),
     outline: null,
@@ -322,6 +331,11 @@ function finishRun(run: RunState, status: RunStatus): void {
   run.finishedAt = Date.now();
   run.summary = summarize(run);
   run.report = composeReport(run);
+  // 异步落盘，不阻塞 SSE 收尾；写盘失败只记日志。
+  // 主动中断的 run 内容不完整，不进历史，避免回看时被半成品误导。
+  if (status !== "aborted") {
+    void saveRunSnapshot(buildSnapshot(run), run.batchId);
+  }
   emit(run, { type: "run:done", summary: run.summary, report: run.report });
 }
 
@@ -330,6 +344,7 @@ function failRun(run: RunState, message: string): void {
   run.finishedAt = Date.now();
   run.summary = summarize(run);
   run.report = composeReport(run);
+  void saveRunSnapshot(buildSnapshot(run), run.batchId);
   emit(run, {
     type: "run:failed",
     message,
