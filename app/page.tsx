@@ -22,36 +22,51 @@ const NODE_META: Record<NodeId, { name: string; desc: string }> = {
   image: { name: "配图 Agent", desc: "扩写提示词并调用 Seedream 出图" },
 };
 
+/** 状态只体现在左色条、圆点和小徽标上，卡片底始终中性，避免多卡同时变绿变蓝 */
 const STATUS_STYLE: Record<
   NodeStatus,
-  { label: string; card: string; dot: string }
+  { label: string; bar: string; badge: string; dot: string }
 > = {
   pending: {
     label: "等待",
-    card: "border-neutral-200 bg-neutral-50",
+    bar: "bg-neutral-200",
+    badge: "bg-neutral-100 text-neutral-500",
     dot: "bg-neutral-300",
   },
   running: {
     label: "生成中",
-    card: "border-blue-300 bg-blue-50",
+    bar: "bg-blue-500",
+    badge: "bg-blue-50 text-blue-700",
     dot: "bg-blue-500 animate-pulse",
   },
   completed: {
     label: "完成",
-    card: "border-green-300 bg-green-50",
-    dot: "bg-green-500",
+    bar: "bg-emerald-500",
+    badge: "bg-emerald-50 text-emerald-700",
+    dot: "bg-emerald-500",
   },
   failed: {
     label: "失败",
-    card: "border-red-300 bg-red-50",
+    bar: "bg-red-500",
+    badge: "bg-red-50 text-red-700",
     dot: "bg-red-500",
   },
   cancelled: {
     label: "已中断",
-    card: "border-amber-300 bg-amber-50",
+    bar: "bg-amber-500",
+    badge: "bg-amber-50 text-amber-700",
     dot: "bg-amber-500",
   },
 };
+
+/** 卡片面、按钮三档权重，避免每处重写一长串 className */
+const CARD = "rounded-xl border border-hairline bg-surface shadow-card";
+const BTN_PRIMARY =
+  "rounded-lg bg-accent px-5 py-2.5 text-sm font-medium text-white transition hover:bg-accent-strong disabled:opacity-40";
+const BTN_GHOST =
+  "rounded-lg border border-hairline-strong bg-surface px-4 py-2.5 text-sm font-medium text-ink-2 transition hover:text-ink disabled:opacity-40";
+const BTN_QUIET =
+  "rounded-md border border-hairline-strong bg-surface px-2.5 py-1 text-xs text-ink-2 transition hover:text-ink disabled:opacity-40";
 
 const RUN_STATUS_TEXT: Record<RunStatus, string> = {
   running: "流水线运行中",
@@ -125,21 +140,21 @@ function variantLabel(key: string | null): string {
 /** 单次运行的执行报告，数据全部来自服务端下发的 RunReport */
 function ReportCard({ report, title = "本次流水线执行报告" }: { report: RunReport; title?: string }) {
   return (
-    <section className="rounded-xl border border-neutral-200 bg-white p-4">
+    <section className="rounded-xl border border-dashed border-hairline-strong bg-surface/60 p-4">
       <div className="flex flex-wrap items-center justify-between gap-2">
-        <h2 className="text-sm font-semibold">{title}</h2>
-        <span className="text-xs text-neutral-400">
+        <h2 className="text-xs font-semibold tracking-wide text-ink-2">{title}</h2>
+        <span className="text-xs tabular-nums text-ink-3">
           总耗时 {formatDuration(report.durationMs)}
         </span>
       </div>
-      <p className="mt-1 text-xs text-neutral-500">
+      <p className="mt-1 text-xs text-ink-3">
         {report.topic}
         {report.variant ? ` · ${variantLabel(report.variant)}` : ""}
       </p>
 
       <div className="mt-3 overflow-x-auto">
-        <table className="w-full min-w-[620px] text-left text-xs">
-          <thead className="text-neutral-400">
+        <table className="w-full min-w-[620px] text-left text-xs tabular-nums">
+          <thead className="text-ink-3">
             <tr>
               <th className="py-1 pr-3 font-normal">节点</th>
               <th className="py-1 pr-3 font-normal">模型</th>
@@ -152,9 +167,9 @@ function ReportCard({ report, title = "本次流水线执行报告" }: { report:
           </thead>
           <tbody>
             {report.nodes.map((n) => (
-              <tr key={n.nodeId} className="border-t border-neutral-100">
-                <td className="py-1.5 pr-3 font-medium text-neutral-700">{n.name}</td>
-                <td className="py-1.5 pr-3 font-mono text-[11px] text-neutral-500">
+              <tr key={n.nodeId} className="border-t border-hairline">
+                <td className="py-1.5 pr-3 font-medium text-ink">{n.name}</td>
+                <td className="py-1.5 pr-3 font-mono text-[11px] text-ink-3">
                   {n.model}
                 </td>
                 <td className="py-1.5 pr-3">
@@ -182,7 +197,7 @@ function ReportCard({ report, title = "本次流水线执行报告" }: { report:
         </table>
       </div>
 
-      <div className="mt-3 flex flex-wrap gap-x-4 gap-y-1 text-xs text-neutral-600">
+      <div className="mt-3 flex flex-wrap gap-x-4 gap-y-1 text-xs text-ink-2">
         <span>模型调用 {report.totals.llmCalls} 次</span>
         <span>token 合计 {formatTokens(report.totals.totalTokens)}</span>
         {report.totals.reasoningTokens > 0 && (
@@ -213,16 +228,18 @@ function BatchSummary({ tasks }: { tasks: TaskResult[] }) {
     0,
   );
   return (
-    <section className="rounded-xl border border-neutral-200 bg-white p-4">
+    <section className="rounded-xl border border-dashed border-hairline-strong bg-surface/60 p-4">
       <div className="flex flex-wrap items-center justify-between gap-2">
-        <h2 className="text-sm font-semibold">批量执行汇总</h2>
-        <span className="text-xs text-neutral-400">
+        <h2 className="text-xs font-semibold tracking-wide text-ink-2">
+          批量执行汇总
+        </h2>
+        <span className="text-xs tabular-nums text-ink-3">
           token 合计 {formatTokens(totalTokens)}
         </span>
       </div>
       <div className="mt-3 overflow-x-auto">
-        <table className="w-full min-w-[520px] text-left text-xs">
-          <thead className="text-neutral-400">
+        <table className="w-full min-w-[520px] text-left text-xs tabular-nums">
+          <thead className="text-ink-3">
             <tr>
               <th className="py-1 pr-3 font-normal">任务</th>
               <th className="py-1 pr-3 font-normal">状态</th>
@@ -233,8 +250,8 @@ function BatchSummary({ tasks }: { tasks: TaskResult[] }) {
           </thead>
           <tbody>
             {tasks.map((t) => (
-              <tr key={t.id} className="border-t border-neutral-100">
-                <td className="py-1.5 pr-3 font-medium text-neutral-700">
+              <tr key={t.id} className="border-t border-hairline">
+                <td className="py-1.5 pr-3 font-medium text-ink">
                   {t.label}
                 </td>
                 <td className="py-1.5 pr-3">
@@ -867,6 +884,23 @@ export default function Home() {
   const batchPercent = batchTotal > 0 ? Math.round((batchCompleted / batchTotal) * 100) : 0;
   const batchUnit = mode === "multi-version" ? "版" : "选题";
 
+  const statusText =
+    currentTaskStatus === "idle"
+      ? "未开始"
+      : currentTaskStatus in RUN_STATUS_TEXT
+        ? RUN_STATUS_TEXT[currentTaskStatus as RunStatus]
+        : currentTaskStatus;
+  const statusDotClass =
+    currentTaskStatus === "failed"
+      ? "bg-red-500"
+      : currentTaskStatus === "completed"
+        ? "bg-emerald-500"
+        : currentTaskStatus === "aborted"
+          ? "bg-amber-500"
+          : currentTaskStatus === "running"
+            ? "bg-blue-500 animate-pulse"
+            : "bg-neutral-300";
+
   function toggleAll() {
     if (allExpanded) {
       setExpanded({});
@@ -884,39 +918,57 @@ export default function Home() {
   }
 
   return (
-    <main className="mx-auto flex w-full max-w-6xl flex-1 flex-col gap-6 px-6 py-10">
-      <header className="flex flex-wrap items-start justify-between gap-3">
-        <div className="flex flex-col gap-2">
-          <h1 className="text-2xl font-semibold">Content Agent Board</h1>
-          <p className="text-sm text-neutral-500">
-            输入选题 → 策划 Agent 拆解提纲 → 长文 / 脚本 / 小红书 / 配图 四路并行
-          </p>
+    <>
+      <header className="sticky top-0 z-20 border-b border-hairline bg-surface/85 backdrop-blur">
+        <div className="mx-auto flex w-full max-w-6xl flex-wrap items-center justify-between gap-3 px-6 py-3">
+          <div className="flex items-center gap-3">
+            <span className="grid h-9 w-9 place-items-center rounded-lg bg-accent text-[13px] font-bold text-white">
+              CA
+            </span>
+            <div className="flex flex-col">
+              <h1 className="text-base font-semibold leading-tight text-ink">
+                Content Agent Board
+              </h1>
+              <p className="text-xs text-ink-3">
+                选题 → 策划拆解 → 长文 / 脚本 / 小红书 / 配图 四路并行
+              </p>
+            </div>
+          </div>
+
+          <div className="flex items-center gap-3">
+            <span className="flex items-center gap-1.5 rounded-full border border-hairline bg-canvas px-2.5 py-1 text-xs text-ink-2">
+              <span className={`h-1.5 w-1.5 rounded-full ${statusDotClass}`} />
+              {statusText}
+            </span>
+            <button
+              onClick={() => {
+                setHistoryOpen((prev) => !prev);
+                if (!historyOpen) void loadHistory();
+              }}
+              className={`${BTN_QUIET} px-3 py-1.5`}
+            >
+              历史记录
+              {historyBatches.length > 0 ? ` (${historyBatches.length})` : ""}
+            </button>
+          </div>
         </div>
-        <button
-          onClick={() => {
-            setHistoryOpen((prev) => !prev);
-            if (!historyOpen) void loadHistory();
-          }}
-          className="rounded-lg border border-neutral-300 bg-white px-3 py-2 text-sm font-medium text-neutral-700"
-        >
-          历史记录{historyBatches.length > 0 ? ` (${historyBatches.length})` : ""}
-        </button>
       </header>
 
+      <main className="mx-auto flex w-full max-w-6xl flex-1 flex-col gap-5 px-6 py-6">
       {/* 历史批次列表：按批次聚合，点某个版本进入只读回看 */}
       {historyOpen && (
-        <section className="flex flex-col gap-3 rounded-xl border border-neutral-200 bg-white p-4">
+        <section className={`${CARD} flex flex-col gap-3 p-4`}>
           <div className="flex items-center justify-between">
-            <h2 className="text-sm font-semibold">最近 5 个批次</h2>
+            <h2 className="text-sm font-semibold text-ink">最近 5 个批次</h2>
             <button
               onClick={() => void loadHistory()}
-              className="text-xs text-neutral-500 underline"
+              className="text-xs text-ink-3 transition hover:text-ink"
             >
               刷新
             </button>
           </div>
           {historyBatches.length === 0 ? (
-            <p className="text-xs text-neutral-400">
+            <p className="text-xs text-ink-3">
               暂无历史任务，跑完一次流水线后会自动保存。
             </p>
           ) : (
@@ -924,24 +976,24 @@ export default function Home() {
               {historyBatches.map((batch) => (
                 <li
                   key={batch.batchId}
-                  className="rounded-lg border border-neutral-200"
+                  className="overflow-hidden rounded-lg border border-hairline"
                 >
-                  <div className="flex flex-wrap items-center gap-2 border-b border-neutral-100 px-3 py-2 text-xs">
+                  <div className="flex flex-wrap items-center gap-2 border-b border-hairline bg-canvas/60 px-3 py-2 text-xs">
                     <span
-                      className="font-medium text-neutral-800"
+                      className="font-medium text-ink"
                       title={batch.topics.join("\n")}
                     >
                       {batch.topics.length > 1
                         ? `${batch.topics.length} 个选题`
                         : batch.topics[0]}
                     </span>
-                    <span className="text-neutral-400">
+                    <span className="tabular-nums text-ink-3">
                       {formatTime(batch.createdAt)}
                     </span>
                     <span
                       className={
                         batch.status === "completed"
-                          ? "text-green-600"
+                          ? "text-emerald-600"
                           : batch.status === "partial"
                             ? "text-amber-600"
                             : "text-red-600"
@@ -953,7 +1005,7 @@ export default function Home() {
                           ? "部分失败"
                           : "全部失败"}
                     </span>
-                    <span className="text-neutral-400">
+                    <span className="text-ink-3">
                       {batch.runs.length} 个版本
                     </span>
                   </div>
@@ -962,10 +1014,10 @@ export default function Home() {
                       <button
                         key={run.runId}
                         onClick={() => void openHistoryRun(run)}
-                        className={`max-w-[16rem] truncate rounded-md border px-2.5 py-1 text-xs ${
+                        className={`max-w-[16rem] truncate rounded-md border px-2.5 py-1 text-xs transition ${
                           reviewing?.runId === run.runId
-                            ? "border-neutral-900 bg-neutral-900 text-white"
-                            : "border-neutral-300 text-neutral-700"
+                            ? "border-accent bg-accent text-white"
+                            : "border-hairline-strong bg-surface text-ink-2 hover:border-ink-3 hover:text-ink"
                         }`}
                         title={run.topic}
                       >
@@ -986,7 +1038,7 @@ export default function Home() {
 
       {/* 回看态提示：只读展示，不建立 SSE */}
       {reviewing && (
-        <div className="flex flex-wrap items-center gap-3 rounded-lg border border-blue-200 bg-blue-50 px-4 py-2.5 text-sm">
+        <div className="flex flex-wrap items-center gap-3 rounded-xl border border-blue-200 bg-blue-50/70 px-4 py-2.5 text-sm">
           <span className="font-medium text-blue-800">历史回看</span>
           <span className="text-blue-700">
             {reviewing.variantName ? `${reviewing.variantName} · ` : ""}
@@ -1004,162 +1056,150 @@ export default function Home() {
         </div>
       )}
 
-      {/* 模式切换 */}
-      <div className="flex gap-1 rounded-lg bg-neutral-100 p-1">
-        {MODE_TABS.map((tab) => (
-          <button
-            key={tab.id}
-            onClick={() => switchMode(tab.id)}
-            disabled={isRunning}
-            className={`flex-1 rounded-md px-4 py-2 text-sm font-medium transition disabled:opacity-40 ${
-              mode === tab.id
-                ? "bg-white text-neutral-900 shadow-sm"
-                : "text-neutral-500 hover:text-neutral-700"
-            }`}
-          >
-            {tab.label}
-          </button>
-        ))}
-      </div>
-
-      {/* 输入区 */}
-      {mode === "single" && (
-        <div className="flex flex-col gap-3 sm:flex-row">
-          <input
-            value={topic}
-            onChange={(e) => setTopic(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === "Enter" && !isRunning) handleStartSingle();
-            }}
-            placeholder="输入一个选题，例如：AI 编程会不会取代程序员"
-            className="flex-1 rounded-lg border border-neutral-300 bg-white px-4 py-2.5 text-sm outline-none focus:border-neutral-500"
-          />
-          <button
-            onClick={handleStartSingle}
-            disabled={isRunning || !topic.trim()}
-            className="rounded-lg bg-neutral-900 px-5 py-2.5 text-sm font-medium text-white disabled:opacity-40"
-          >
-            {isRunning ? "运行中…" : "开始生成"}
-          </button>
-          <button
-            onClick={handleStopAll}
-            disabled={!isRunning}
-            className="rounded-lg border border-neutral-300 px-5 py-2.5 text-sm font-medium disabled:opacity-40"
-          >
-            全部中断
-          </button>
-          <button
-            onClick={handleExportAll}
-            disabled={!isCompleted}
-            className="rounded-lg bg-emerald-600 px-5 py-2.5 text-sm font-medium text-white disabled:opacity-40"
-          >
-            导出全部
-          </button>
+      {/* 运行控制台：模式切换 + 输入 + 动作收进一张卡，按钮按权重分主次 */}
+      <section className={`${CARD} overflow-hidden`}>
+        <div className="flex gap-1 border-b border-hairline bg-canvas/70 p-2">
+          {MODE_TABS.map((tab) => (
+            <button
+              key={tab.id}
+              onClick={() => switchMode(tab.id)}
+              disabled={isRunning}
+              className={`flex-1 rounded-md px-4 py-2 text-sm font-medium transition disabled:opacity-40 ${
+                mode === tab.id
+                  ? "bg-surface text-ink shadow-card"
+                  : "text-ink-2 hover:text-ink"
+              }`}
+            >
+              {tab.label}
+            </button>
+          ))}
         </div>
-      )}
 
-      {showBatchInput && (
-        <div className="flex flex-col gap-3">
-          {mode === "multi-topic" ? (
-            <textarea
-              value={multiTopic}
-              onChange={(e) => setMultiTopic(e.target.value)}
-              placeholder={"每行一个选题，最多 3 个，例如：\nAI 编程会不会取代程序员\n远程办公的利与弊\n如何培养专注力"}
-              rows={4}
-              className="w-full rounded-lg border border-neutral-300 bg-white px-4 py-3 text-sm outline-none focus:border-neutral-500"
-            />
-          ) : (
-            <div className="flex flex-col gap-3">
+        <div className="flex flex-col gap-3 p-4">
+          {mode === "single" && (
+            <div className="flex flex-col gap-2 sm:flex-row">
               <input
                 value={topic}
                 onChange={(e) => setTopic(e.target.value)}
-                placeholder="输入一个选题，将按三个维度各生成一版"
-                className="w-full rounded-lg border border-neutral-300 bg-white px-4 py-2.5 text-sm outline-none focus:border-neutral-500"
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" && !isRunning) handleStartSingle();
+                }}
+                placeholder="输入一个选题，例如：AI 编程会不会取代程序员"
+                className="flex-1 rounded-lg border border-hairline-strong bg-surface px-3.5 py-2.5 text-sm text-ink outline-none transition placeholder:text-ink-3 focus:border-accent focus:ring-4 focus:ring-accent/10"
               />
               <div className="flex flex-wrap gap-2">
-                {VARIANTS.map((v) => (
-                  <div
-                    key={v.key}
-                    className="flex flex-col gap-0.5 rounded-lg border border-neutral-200 bg-white px-3 py-2"
-                  >
-                    <span className="text-xs font-medium text-neutral-800">{v.name}</span>
-                    <span className="text-[11px] text-neutral-400">{v.angle}</span>
-                  </div>
-                ))}
+                <button
+                  onClick={handleStartSingle}
+                  disabled={isRunning || !topic.trim()}
+                  className={BTN_PRIMARY}
+                >
+                  {isRunning ? "运行中…" : "开始生成"}
+                </button>
+                <button
+                  onClick={handleStopAll}
+                  disabled={!isRunning}
+                  className={BTN_GHOST}
+                >
+                  全部中断
+                </button>
+                <button
+                  onClick={handleExportAll}
+                  disabled={!isCompleted}
+                  className={BTN_GHOST}
+                >
+                  导出全部
+                </button>
               </div>
             </div>
           )}
-          <div className="flex gap-3">
-            <button
-              onClick={handleStartBatch}
-              disabled={
-                isRunning ||
-                (mode === "multi-topic"
-                  ? !multiTopic.trim()
-                  : !topic.trim())
-              }
-              className="rounded-lg bg-neutral-900 px-5 py-2.5 text-sm font-medium text-white disabled:opacity-40"
-            >
-              {isRunning ? "运行中…" : "开始批量生成"}
-            </button>
-            <button
-              onClick={handleStopAll}
-              disabled={!isRunning}
-              className="rounded-lg border border-neutral-300 px-5 py-2.5 text-sm font-medium disabled:opacity-40"
-            >
-              全部中断
-            </button>
-            <button
-              onClick={handleExportAll}
-              disabled={!isCompleted}
-              className="rounded-lg bg-emerald-600 px-5 py-2.5 text-sm font-medium text-white disabled:opacity-40"
-            >
-              导出当前套
-            </button>
-          </div>
-        </div>
-      )}
 
-      {/* 状态栏 */}
-      <div className="flex flex-wrap items-center gap-3 text-sm">
-        <span className="text-neutral-500">流水线状态</span>
-        <span
-          className={
-            currentTaskStatus === "failed"
-              ? "font-medium text-red-600"
-              : currentTaskStatus === "completed"
-                ? "font-medium text-green-600"
-                : currentTaskStatus === "aborted"
-                  ? "font-medium text-amber-600"
-                  : "font-medium"
-          }
-        >
-          {currentTaskStatus === "idle"
-            ? "未开始"
-            : currentTaskStatus in RUN_STATUS_TEXT
-              ? RUN_STATUS_TEXT[currentTaskStatus as RunStatus]
-              : currentTaskStatus}
-        </span>
-        {currentRunId && (
-          <span className="text-xs text-neutral-400">runId: {currentRunId.slice(0, 8)}</span>
-        )}
-        {notice && <span className="text-red-600">{notice}</span>}
-        {reconnectNotice && (
-          <span className="text-amber-600">{reconnectNotice}</span>
-        )}
-        <button
-          onClick={toggleAll}
-          className="ml-auto rounded-md border border-neutral-300 bg-white px-2.5 py-1 text-xs"
-        >
-          {allExpanded ? "全部收起" : "全部展开"}
-        </button>
-      </div>
+          {showBatchInput && (
+            <div className="flex flex-col gap-3">
+              {mode === "multi-topic" ? (
+                <textarea
+                  value={multiTopic}
+                  onChange={(e) => setMultiTopic(e.target.value)}
+                  placeholder={"每行一个选题，最多 3 个，例如：\nAI 编程会不会取代程序员\n远程办公的利与弊\n如何培养专注力"}
+                  rows={4}
+                  className="w-full rounded-lg border border-hairline-strong bg-surface px-3.5 py-3 text-sm text-ink outline-none transition placeholder:text-ink-3 focus:border-accent focus:ring-4 focus:ring-accent/10"
+                />
+              ) : (
+                <div className="flex flex-col gap-3">
+                  <input
+                    value={topic}
+                    onChange={(e) => setTopic(e.target.value)}
+                    placeholder="输入一个选题，将按三个维度各生成一版"
+                    className="w-full rounded-lg border border-hairline-strong bg-surface px-3.5 py-2.5 text-sm text-ink outline-none transition placeholder:text-ink-3 focus:border-accent focus:ring-4 focus:ring-accent/10"
+                  />
+                  <div className="flex flex-wrap gap-2">
+                    {VARIANTS.map((v) => (
+                      <div
+                        key={v.key}
+                        className="flex flex-col gap-0.5 rounded-lg border border-hairline bg-canvas/60 px-3 py-2"
+                      >
+                        <span className="text-xs font-medium text-ink">{v.name}</span>
+                        <span className="text-[11px] text-ink-3">{v.angle}</span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+              <div className="flex flex-wrap gap-2">
+                <button
+                  onClick={handleStartBatch}
+                  disabled={
+                    isRunning ||
+                    (mode === "multi-topic"
+                      ? !multiTopic.trim()
+                      : !topic.trim())
+                  }
+                  className={BTN_PRIMARY}
+                >
+                  {isRunning ? "运行中…" : "开始批量生成"}
+                </button>
+                <button
+                  onClick={handleStopAll}
+                  disabled={!isRunning}
+                  className={BTN_GHOST}
+                >
+                  全部中断
+                </button>
+                <button
+                  onClick={handleExportAll}
+                  disabled={!isCompleted}
+                  className={BTN_GHOST}
+                >
+                  导出当前套
+                </button>
+              </div>
+            </div>
+          )}
+        </div>
+
+        {/* 运行状态条：常驻在控制台底部 */}
+        <div className="flex flex-wrap items-center gap-x-3 gap-y-1 border-t border-hairline bg-canvas/50 px-4 py-2 text-xs">
+          <span className="text-ink-3">流水线状态</span>
+          <span className="flex items-center gap-1.5 font-medium text-ink">
+            <span className={`h-1.5 w-1.5 rounded-full ${statusDotClass}`} />
+            {statusText}
+          </span>
+          {currentRunId && (
+            <span className="font-mono text-[11px] text-ink-3">
+              runId {currentRunId.slice(0, 8)}
+            </span>
+          )}
+          {notice && <span className="text-red-600">{notice}</span>}
+          {reconnectNotice && (
+            <span className="text-amber-600">{reconnectNotice}</span>
+          )}
+        </div>
+      </section>
 
       {/* 批量模式全局进度 */}
       {mode !== "single" && batchTotal > 0 && (
         <div className="flex flex-col gap-2">
           <div className="flex flex-wrap items-center gap-3 text-xs">
-            <span className="font-medium text-neutral-700">
+            <span className="font-medium text-ink">
               批量 {batchTotal} {batchUnit}：已完成 {batchCompleted}/{batchTotal}
               {batchRunning
                 ? `，当前运行 ${batchRunning.label}`
@@ -1176,7 +1216,7 @@ export default function Home() {
           </div>
           <div className="h-1.5 w-full overflow-hidden rounded-full bg-neutral-200">
             <div
-              className="h-full rounded-full bg-emerald-500 transition-all"
+              className="h-full rounded-full bg-accent transition-all"
               style={{ width: `${batchPercent}%` }}
             />
           </div>
@@ -1190,10 +1230,10 @@ export default function Home() {
             <button
               key={t.id}
               onClick={() => setActiveTaskIndex(idx)}
-              className={`flex items-center gap-2 rounded-lg border px-3 py-1.5 text-xs ${
+              className={`flex items-center gap-2 rounded-lg border px-3 py-1.5 text-xs transition ${
                 idx === activeTaskIndex
-                  ? "border-neutral-900 bg-neutral-900 text-white"
-                  : "border-neutral-200 bg-white text-neutral-600"
+                  ? "border-accent bg-accent text-white"
+                  : "border-hairline bg-surface text-ink-2 hover:text-ink"
               }`}
             >
               <span
@@ -1215,8 +1255,19 @@ export default function Home() {
         </div>
       )}
 
+      {/* 执行监视 */}
+      <div className="mt-1 flex flex-wrap items-center justify-between gap-2">
+        <div className="flex items-baseline gap-2">
+          <h2 className="text-sm font-semibold text-ink">执行监视</h2>
+          <span className="text-xs text-ink-3">5 个 Agent 节点</span>
+        </div>
+        <button onClick={toggleAll} className={BTN_QUIET}>
+          {allExpanded ? "全部收起" : "全部展开"}
+        </button>
+      </div>
+
       {/* 卡片区 */}
-      <div className="grid grid-cols-1 gap-4 md:grid-cols-4 md:items-start">
+      <div className="grid grid-cols-1 gap-4 md:grid-cols-2 md:items-start xl:grid-cols-4">
         {NODE_ORDER.map((nodeId) => {
           const node = currentNodes[nodeId];
           const style = STATUS_STYLE[node.status];
@@ -1234,10 +1285,15 @@ export default function Home() {
           return (
             <section
               key={nodeId}
-              className={`flex flex-col gap-3 rounded-xl border p-4 ${style.card} ${
-                isPlanner ? "md:col-span-4" : ""
+              className={`relative flex flex-col gap-3 overflow-hidden rounded-xl border border-hairline bg-surface p-4 shadow-card ${
+                isPlanner ? "md:col-span-2 xl:col-span-4" : ""
               }`}
             >
+              {/* 状态用左色条表达，卡片底始终中性 */}
+              <span
+                className={`absolute inset-y-0 left-0 w-[3px] ${style.bar}`}
+                aria-hidden
+              />
               <button
                 type="button"
                 onClick={() => toggleNode(nodeId)}
@@ -1245,37 +1301,44 @@ export default function Home() {
               >
                 <span className="flex items-center gap-2">
                   <span className={`h-2 w-2 rounded-full ${style.dot}`} />
-                  <span className="text-sm font-semibold">{NODE_META[nodeId].name}</span>
+                  <span className="text-sm font-semibold text-ink">
+                    {NODE_META[nodeId].name}
+                  </span>
+                  {isPlanner && (
+                    <span className="rounded border border-hairline bg-canvas px-1.5 py-0.5 text-[10px] text-ink-3">
+                      结构化提纲
+                    </span>
+                  )}
                 </span>
                 <span className="flex items-center gap-2">
-                  <span className="rounded-full bg-white/70 px-2 py-0.5 text-xs text-neutral-600">
+                  <span className={`rounded-full px-2 py-0.5 text-xs ${style.badge}`}>
                     {style.label}
                     {node.attempt > 1 ? ` · 第${node.attempt}次` : ""}
                   </span>
-                  <span className="text-xs text-neutral-400">
+                  <span className="text-xs text-ink-3">
                     {isExpanded ? "收起" : "展开"}
                   </span>
                 </span>
               </button>
 
-              <p className="text-xs text-neutral-500">{NODE_META[nodeId].desc}</p>
+              <p className="text-xs text-ink-3">{NODE_META[nodeId].desc}</p>
 
               {/* 执行指标：耗时 / token / 重试，折叠态也展示 */}
               {node.metrics && (
-                <div className="flex flex-wrap items-center gap-1.5 text-[11px]">
-                  <span className="rounded bg-white/70 px-1.5 py-0.5 text-neutral-600">
+                <div className="flex flex-wrap items-center gap-1.5 text-[11px] tabular-nums">
+                  <span className="rounded border border-hairline bg-canvas px-1.5 py-0.5 text-ink-2">
                     {node.metrics.durationMs !== undefined
                       ? formatDuration(node.metrics.durationMs)
                       : "计时中"}
                   </span>
                   {node.metrics.usage && (
-                    <span className="rounded bg-white/70 px-1.5 py-0.5 text-neutral-600">
+                    <span className="rounded border border-hairline bg-canvas px-1.5 py-0.5 text-ink-2">
                       {formatTokens(node.metrics.usage.totalTokens)} tokens
                       {node.metrics.usageEstimated ? "（估算）" : ""}
                     </span>
                   )}
                   {node.metrics.retries > 0 && (
-                    <span className="rounded bg-amber-100 px-1.5 py-0.5 text-amber-700">
+                    <span className="rounded border border-amber-200 bg-amber-50 px-1.5 py-0.5 text-amber-700">
                       重试 {node.metrics.retries} 次
                     </span>
                   )}
@@ -1283,7 +1346,7 @@ export default function Home() {
               )}
 
               {node.error && (
-                <p className="rounded-md bg-red-100 px-2 py-1 text-xs text-red-700">
+                <p className="rounded-md border border-red-200 bg-red-50 px-2 py-1 text-xs text-red-700">
                   {node.error}
                 </p>
               )}
@@ -1296,31 +1359,31 @@ export default function Home() {
                     <img
                       src={node.imageUrl}
                       alt="配图结果"
-                      className="w-full rounded-lg border border-neutral-200 object-cover"
+                      className="w-full rounded-lg border border-hairline object-cover"
                     />
                   )}
                   {node.content ? (
                     <>
-                      <p className="truncate text-xs text-neutral-600">
+                      <p className="truncate text-xs text-ink-2">
                         {node.content.trim().split("\n")[0]}
                       </p>
-                      <span className="text-[11px] text-neutral-400">
+                      <span className="text-[11px] text-ink-3">
                         已生成 {node.content.length} 字
                       </span>
                     </>
                   ) : (
-                    <span className="text-[11px] text-neutral-400">（暂无内容）</span>
+                    <span className="text-[11px] text-ink-3">（暂无内容）</span>
                   )}
                 </div>
               )}
 
               {isExpanded && (
                 <>
-                  <div className="flex gap-2">
+                  <div className="flex flex-wrap gap-2">
                     <button
                       onClick={() => handleStopNode(nodeId)}
                       disabled={!isRunning || !canStop}
-                      className="rounded-md border border-neutral-300 bg-white px-2.5 py-1 text-xs disabled:opacity-40"
+                      className={BTN_QUIET}
                     >
                       中断
                     </button>
@@ -1328,7 +1391,7 @@ export default function Home() {
                       <button
                         onClick={() => handleRerun(nodeId)}
                         disabled={!canRerun}
-                        className="rounded-md border border-neutral-300 bg-white px-2.5 py-1 text-xs disabled:opacity-40"
+                        className={BTN_QUIET}
                       >
                         重跑
                       </button>
@@ -1337,10 +1400,10 @@ export default function Home() {
                       <button
                         onClick={() => handleCopy(nodeId)}
                         disabled={!!copied[nodeId]}
-                        className={`rounded-md border px-2.5 py-1 text-xs ${
+                        className={`rounded-md border px-2.5 py-1 text-xs transition ${
                           copied[nodeId]
-                            ? "border-neutral-200 bg-neutral-100 text-neutral-400"
-                            : "border-neutral-300 bg-white"
+                            ? "border-hairline bg-canvas text-ink-3"
+                            : "border-hairline-strong bg-surface text-ink-2 hover:text-ink"
                         }`}
                       >
                         {copied[nodeId] ? "已复制" : "复制"}
@@ -1354,12 +1417,9 @@ export default function Home() {
                       <img
                         src={node.imageUrl}
                         alt="配图结果"
-                        className="w-full rounded-lg border border-neutral-200 object-cover"
+                        className="w-full rounded-lg border border-hairline object-cover"
                       />
-                      <button
-                        onClick={handleDownloadImage}
-                        className="self-start rounded-md border border-neutral-300 bg-white px-2.5 py-1 text-xs"
-                      >
+                      <button onClick={handleDownloadImage} className={BTN_QUIET}>
                         下载图片
                       </button>
                     </>
@@ -1369,14 +1429,14 @@ export default function Home() {
                     node.status === "running" &&
                     !node.imageUrl &&
                     node.content && (
-                      <p className="rounded-md bg-blue-100 px-2 py-1 text-xs text-blue-700">
+                      <p className="rounded-md border border-blue-200 bg-blue-50 px-2 py-1 text-xs text-blue-700">
                         提示词已生成，正在调用 Seedream 出图…
                       </p>
                     )}
 
                   <pre
-                    className={`overflow-auto whitespace-pre-wrap break-words rounded-lg bg-white/70 p-3 text-xs leading-relaxed text-neutral-700 ${
-                      isPlanner ? "max-h-64" : "max-h-80"
+                    className={`overflow-auto whitespace-pre-wrap break-words rounded-lg border border-hairline bg-canvas p-3 text-xs leading-relaxed text-ink-2 ${
+                      isPlanner ? "max-h-64 font-mono text-[11px]" : "max-h-80"
                     }`}
                   >
                     {node.content || "（暂无内容）"}
@@ -1406,6 +1466,7 @@ export default function Home() {
         tasks.every((t) => t.status !== "running" && t.status !== "pending") && (
           <BatchSummary tasks={tasks} />
         )}
-    </main>
+      </main>
+    </>
   );
 }
