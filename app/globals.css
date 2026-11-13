@@ -1,26 +1,41 @@
 @import "tailwindcss";
 
+/* 设计 token：颜色只在这里定义一次，组件里一律用语义类名，不写死色值 */
 :root {
-  --background: #ffffff;
-  --foreground: #171717;
+  --canvas: #f6f7f9;
+  --surface: #ffffff;
+  --hairline: #e6e8ec;
+  --hairline-strong: #d7dbe2;
+  --ink: #14161a;
+  --ink-2: #5b6270;
+  --ink-3: #8b93a1;
+  --accent: #4f46e5;
+  --accent-strong: #4338ca;
 }
 
 @theme inline {
-  --color-background: var(--background);
-  --color-foreground: var(--foreground);
+  --color-canvas: var(--canvas);
+  --color-surface: var(--surface);
+  --color-hairline: var(--hairline);
+  --color-hairline-strong: var(--hairline-strong);
+  --color-ink: var(--ink);
+  --color-ink-2: var(--ink-2);
+  --color-ink-3: var(--ink-3);
+  --color-accent: var(--accent);
+  --color-accent-strong: var(--accent-strong);
   --font-sans: var(--font-geist-sans);
   --font-mono: var(--font-geist-mono);
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
-  }
+@theme {
+  --shadow-card: 0 1px 2px rgba(16, 24, 40, 0.04);
+  --shadow-pop: 0 8px 24px -12px rgba(16, 24, 40, 0.18);
 }
 
+/* Geist 只含拉丁字形，中文回落到系统字体；主题固定浅色，不再跟随系统深色 */
 body {
-  background: var(--background);
-  color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+  background: var(--canvas);
+  color: var(--ink);
+  font-family: var(--font-geist-sans), "PingFang SC", "Microsoft YaHei",
+    system-ui, sans-serif;
 }
