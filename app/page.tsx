@@ -927,8 +927,13 @@ export default function Home() {
                   className="rounded-lg border border-neutral-200"
                 >
                   <div className="flex flex-wrap items-center gap-2 border-b border-neutral-100 px-3 py-2 text-xs">
-                    <span className="font-medium text-neutral-800">
-                      {batch.topic}
+                    <span
+                      className="font-medium text-neutral-800"
+                      title={batch.topics.join("\n")}
+                    >
+                      {batch.topics.length > 1
+                        ? `${batch.topics.length} 个选题`
+                        : batch.topics[0]}
                     </span>
                     <span className="text-neutral-400">
                       {formatTime(batch.createdAt)}
@@ -957,13 +962,15 @@ export default function Home() {
                       <button
                         key={run.runId}
                         onClick={() => void openHistoryRun(run)}
-                        className={`rounded-md border px-2.5 py-1 text-xs ${
+                        className={`max-w-[16rem] truncate rounded-md border px-2.5 py-1 text-xs ${
                           reviewing?.runId === run.runId
                             ? "border-neutral-900 bg-neutral-900 text-white"
                             : "border-neutral-300 text-neutral-700"
                         }`}
+                        title={run.topic}
                       >
-                        {run.variantName ?? "单次生成"}
+                        {run.variantName ??
+                          (batch.runs.length === 1 ? "单次生成" : run.topic)}
                         {run.durationMs !== null
                           ? ` · ${formatDuration(run.durationMs)}`
                           : ""}

@@ -39,7 +39,10 @@ export interface HistoryRunEntry {
 
 export interface HistoryBatch {
   batchId: string;
+  /** 批次内第一个选题，单选题批次直接用这个做标题 */
   topic: string;
+  /** 去重后的全部选题：批量选题模式下同一批次会有多个不同选题 */
+  topics: string[];
   status: BatchStatus;
   createdAt: number;
   finishedAt: number | null;
@@ -150,6 +153,7 @@ export async function listHistoryBatches(
     batches.push({
       batchId,
       topic: runs[0].topic,
+      topics: Array.from(new Set(runs.map((r) => r.topic))),
       status: batchStatus(runs),
       createdAt,
       finishedAt: Math.max(...finished),
