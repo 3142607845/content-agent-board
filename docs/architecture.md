@@ -113,6 +113,8 @@
   topic: string;
   variant: "analysis" | "story" | "beginner" | null;
   styles: { longform?: StyleSnapshot; script?: StyleSnapshot; xhs?: StyleSnapshot };
+  outlineVersions: OutlineVersion[];     // 本次 run 的全部提纲版本
+  outlineVersionId: string | null;       // 当前生效的提纲版本
   status: "running" | "completed" | "failed" | "aborted";
   createdAt: number;
   finishedAt: number | null;
@@ -306,6 +308,54 @@ page.tsx (styles: { channel: templateId })
 - 运行控制台三个下拉，分别对应三个下游 Agent；运行中锁定，随 run 快照落盘
 - 卡片标题下显示「风格 · xxx」徽标，执行报告新增「文风」列
 
+## 提纲人工干预与版本回退
+
+策划 Agent 生成提纲后，提纲原本是只读的：不满意只能整条流水线重跑，策划和 4 个下游全部重新调用，既费 token 也费时间。本轮把提纲变成可编辑、可回退的运行时数据。
+
+**版本链模型（`lib/orchestrator.ts`）**
+
+```ts
+interface OutlineVersion {
+  id: string;        // v1 / v2 …
+  label: string;     // 策划原始 / 手动编辑
+  source: "planner" | "manual";
+  createdAt: number;
+  outline: unknown;  // 完整提纲 JSON
+}
+```
+
+- `RunState.outlineVersions` 保存本次 run 的全部版本，`activeOutlineVersionId` 指向当前生效版本
+- `run.outline` 仍是「当前生效提纲」，单节点重跑与下游入参都读它，原有逻辑不变
+- 版本链随 `RunSnapshot` 下发并落盘，历史回看也能看到当时的全部版本
+- 每个 run 独立维护版本链，多版模式 3 个 run 互不影响
+
+**接口**
+
+| 接口 | 说明 |
+|---|---|
+| `POST /api/outline/[runId]` | 提交编辑后的提纲或回退版本，局部重生成下游 |
+
+请求体只需 `{ outline: <完整提纲对象> }`。服务端按顺序处理：
+
+1. run 不存在 → 404；策划未完成、提纲结构非法、内容无变化 → 400；有节点在跑 → 409
+2. 按 `longForm / script / xhs / image` 逐渠道做 `JSON.stringify` diff
+3. 有变化：内容与某个历史版本完全一致时直接激活该版本（回退不新增版本），否则追加 `vN 手动编辑`
+4. 只重置受影响节点并重新调度，其余节点 `content / imageUrl / metrics` 原样保留
+5. 重新生成报告并落盘，返回 `{ version, versions, affected }`
+
+**前端交互（策划卡展开态）**
+
+- 「编辑提纲」进入编辑态：当前版本格式化成 JSON 放进 textarea，实时校验语法，非法时提交按钮禁用
+- 编辑区上方是版本 chips（`v1 · 策划原始 · 当前`、`v2 · 手动编辑`），点任意版本即载入编辑器，实现回退预览
+- 主按钮「基于当前提纲重生成下游」，提交后重连 SSE 观察本次局部重生成
+- 历史回看态只读，可查看版本链但不能编辑；运行中可编辑文本，提交按钮锁定
+
+**边界**
+
+- 只改 `topic` 不触发任何渠道变化，接口明确拒绝，避免产生「看起来提交了但什么都没发生」的版本
+- 「变化」按渠道片段序列化结果判定，改一个标点也算变化
+- 局部重跑后报告里未受影响节点沿用上一轮指标；整体墙钟时间仍是 run 创建到最终结束的跨度
+
 ## 技术架构
 
 ```
@@ -324,6 +374,7 @@ page.tsx (styles: { channel: templateId })
 │ POST /api/run            启动流水线，返回 runId        │
 │ POST /api/stop/:runId    中断全部；?nodeId= 单节点中断 │
 │ POST /api/rerun/:nodeId  重跑单个节点                  │
+│ POST /api/outline/:runId 基于编辑后的提纲局部重生成下游 │
 │ GET  /api/stream/:runId  SSE：全量快照 + 增量事件       │
 │ GET  /api/run/:runId     一次性取快照与执行报告          │
 │ GET  /api/styles         风格模板列表；POST/PUT/DELETE 管理 │
@@ -361,6 +412,7 @@ page.tsx (styles: { channel: templateId })
 8. **历史记录按批次限流，而不是按 run**：多版模式一次点击产出的 3 个 run 属于同一个 `batchId`。若按 run 限 5 条，两批就把名额吃光；按批次限 5 个，回看时也正好是「一批 3 个版本」的对比单元。淘汰时整批删除，不会出现同批只剩一半版本。
 9. **风格模板按 run 存快照，而不是只存模板 id**：模板可编辑可删除，历史任务却需要长期可解释。存 `{ id, name, prompt }` 后，模板后续怎么变都不影响已完成的 run，回看时能还原当时的完整入参。代价是快照体积增加约 1 KB/渠道，相对于正文可忽略。
 10. **内置模板只读，改内置走「复制」**：允许直接编辑内置模板会导致演示环境的默认文风被改坏且无法回到初始状态。只读 + 复制既保证默认可用，又保留了自定义空间；存储层同时兜底，即使手改 `data/styles.json` 把 `builtin` 改成 true 也会被强制改回 false。
+11. **提纲版本链 + 渠道级 diff，而不是重跑全部下游**：人工改提纲通常只动某一个平台的写法，把 4 个下游全部重跑既浪费 token，也会把已经满意的小红书、配图产出覆盖掉。按渠道 diff 后只调度受影响的节点，未改动节点连指标都不动；版本链则保证每次提交都能回退，且提交内容与历史版本一致时直接复用旧版本，避免回退把版本列表刷爆。
 
 ## 模块职责
 
@@ -374,7 +426,8 @@ page.tsx (styles: { channel: templateId })
 | 历史列表 | app/api/history/route.ts | 返回最近 5 个批次的回看摘要 |
 | 中断接口 | app/api/stop/[runId]/route.ts | 中断全部；带 nodeId 则只中断指定节点 |
 | 重跑接口 | app/api/rerun/[nodeId]/route.ts | 重跑单节点 |
-| 编排引擎 | lib/orchestrator.ts | 状态机、并行调度、中断/重跑、节点指标采集、终态收尾 |
+| 提纲重生成接口 | app/api/outline/[runId]/route.ts | 接收人工编辑提纲，按渠道 diff 局部重跑下游 |
+| 编排引擎 | lib/orchestrator.ts | 状态机、并行调度、中断/重跑、提纲版本链与局部重生成、节点指标采集、终态收尾 |
 | 执行报告 | lib/report.ts | 报告模型与生成逻辑（耗时、token、重试、并行加速比），纯函数无副作用 |
 | Agent 基类 | lib/agents/base.ts | 模型调用、流式、AbortSignal、usage 回调透传 |
 | 各 Agent | lib/agents/*.ts | 各自 prompt + 模型配置 |

@@ -12,6 +12,7 @@ import type {
   AgentNodeState,
   NodeId,
   NodeStatus,
+  OutlineVersion,
   RunSnapshot,
   RunStatus,
 } from "@/lib/orchestrator";
@@ -128,6 +129,24 @@ function formatTime(ts: number): string {
   const d = new Date(ts);
   const pad = (n: number) => String(n).padStart(2, "0");
   return `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+/** 提纲文本解析：提交前先拦一道语法错误，避免无效请求打到服务端 */
+function parseOutlineText(
+  text: string,
+): { ok: true; value: unknown } | { ok: false; error: string } {
+  try {
+    const value = JSON.parse(text);
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+      return { ok: false, error: "提纲必须是 JSON 对象" };
+    }
+    return { ok: true, value };
+  } catch (err) {
+    return {
+      ok: false,
+      error: err instanceof Error ? err.message : "JSON 解析失败",
+    };
+  }
 }
 
 type Mode = "single" | "multi-topic" | "multi-version";
@@ -424,6 +443,19 @@ export default function Home() {
   const [styleError, setStyleError] = useState("");
   const [styleBusy, setStyleBusy] = useState(false);
 
+  // 提纲人工干预：版本链按 runId 缓存，批量模式切换 tab 不丢
+  const [outlines, setOutlines] = useState<
+    Record<string, { versions: OutlineVersion[]; activeId: string | null }>
+  >({});
+  const [outlineEditing, setOutlineEditing] = useState(false);
+  const [outlineDraft, setOutlineDraft] = useState("");
+  const [outlineSelectedVersion, setOutlineSelectedVersion] = useState<
+    string | null
+  >(null);
+  const [outlineError, setOutlineError] = useState("");
+  const [outlineNotice, setOutlineNotice] = useState("");
+  const [outlineBusy, setOutlineBusy] = useState(false);
+
   // 首次进入的三步引导：localStorage 只记一次，也可从头部按钮重新唤起
   const [tourStep, setTourStep] = useState(0);
   const [tourLayout, setTourLayout] = useState<{
@@ -546,6 +578,17 @@ export default function Home() {
   const isRunning = currentTaskStatus === "running";
   const isCompleted = currentTaskStatus === "completed";
 
+  // 当前 run 的提纲版本链与编辑草稿状态
+  const currentOutline = currentRunId ? outlines[currentRunId] ?? null : null;
+  const outlineVersions = currentOutline?.versions ?? [];
+  const activeOutlineVersion =
+    outlineVersions.find((v) => v.id === currentOutline?.activeId) ?? null;
+  const draftParse = outlineEditing ? parseOutlineText(outlineDraft) : null;
+  const outlineChanged =
+    draftParse?.ok === true &&
+    JSON.stringify(draftParse.value) !==
+      JSON.stringify(activeOutlineVersion?.outline ?? null);
+
   const patchNodeSingle = useCallback(
     (nodeId: NodeId, patch: Partial<AgentNodeState>) => {
       setNodes((prev) => ({
@@ -578,6 +621,31 @@ export default function Home() {
     [],
   );
 
+  /** 快照里的提纲版本链按 runId 并入本地缓存，单次与批量模式共用 */
+  const applyOutlineSnapshot = useCallback((snap: RunSnapshot) => {
+    setOutlines((prev) => ({
+      ...prev,
+      [snap.runId]: {
+        versions: snap.outlineVersions ?? [],
+        activeId: snap.outlineVersionId ?? null,
+      },
+    }));
+  }, []);
+
+  /** 策划完成时快照里还没有版本链，单独拉一次全量快照补上 */
+  const refreshOutline = useCallback(
+    async (id: string) => {
+      try {
+        const res = await fetch(`/api/run/${id}`, { cache: "no-store" });
+        if (!res.ok) return;
+        applyOutlineSnapshot((await res.json()) as RunSnapshot);
+      } catch {
+        // 拉取失败不影响主流程，策划卡会退回展示原始文本
+      }
+    },
+    [applyOutlineSnapshot],
+  );
+
   // 单次模式 SSE
   const connectSingle = useCallback(
     (id: string) => {
@@ -591,6 +659,7 @@ export default function Home() {
         setNodes(snap.nodes);
         setRunStatus(snap.status);
         setReport(snap.report);
+        applyOutlineSnapshot(snap);
         setReconnectNotice("");
         if (snap.status !== "running") es.close();
       });
@@ -635,6 +704,8 @@ export default function Home() {
       es.addEventListener("node:done", (ev) => {
         const d = JSON.parse((ev as MessageEvent).data) as { nodeId: NodeId };
         patchNodeSingle(d.nodeId, { status: "completed" });
+        // 策划完成瞬间版本链才产生，补拉一次快照让编辑入口立刻可用
+        if (d.nodeId === "planner") void refreshOutline(id);
       });
 
       es.addEventListener("node:error", (ev) => {
@@ -680,7 +751,7 @@ export default function Home() {
         }
       };
     },
-    [patchNodeSingle, expandNode, loadHistory],
+    [patchNodeSingle, expandNode, loadHistory, applyOutlineSnapshot, refreshOutline],
   );
 
   // 批量模式 SSE，返回 Promise 在 run 结束时 resolve
@@ -701,6 +772,7 @@ export default function Home() {
               : t,
           ),
         );
+        applyOutlineSnapshot(snap);
         setReconnectNotice("");
         if (snap.status !== "running") {
           es.close();
@@ -757,6 +829,7 @@ export default function Home() {
       es.addEventListener("node:done", (ev) => {
         const d = JSON.parse((ev as MessageEvent).data) as { nodeId: NodeId };
         patchNodeTask(taskIndex, d.nodeId, { status: "completed" });
+        if (d.nodeId === "planner") void refreshOutline(runId);
       });
 
       es.addEventListener("node:error", (ev) => {
@@ -828,6 +901,7 @@ export default function Home() {
     setReconnectNotice("");
     setCopied({});
     setExpanded({});
+    resetOutlineEditor();
     try {
       const res = await fetch("/api/run", {
         method: "POST",
@@ -881,6 +955,7 @@ export default function Home() {
     setReconnectNotice("");
     setCopied({});
     setExpanded({});
+    resetOutlineEditor();
     batchRunningRef.current = true;
 
     // 同一批任务共享 batchId，历史回看时聚合为一个批次
@@ -982,6 +1057,108 @@ export default function Home() {
     }
   }
 
+  // —— 提纲人工干预：编辑、版本回退、局部重生成 ——
+  function beginOutlineEdit(version?: OutlineVersion) {
+    if (!currentRunId) return;
+    const target = version ?? activeOutlineVersion;
+    const text = target
+      ? JSON.stringify(target.outline, null, 2)
+      : currentNodes.planner.content.trim();
+    setOutlineDraft(text);
+    setOutlineSelectedVersion(target?.id ?? null);
+    setOutlineEditing(true);
+    setOutlineError("");
+    setOutlineNotice("");
+    expandNode("planner");
+  }
+
+  function cancelOutlineEdit() {
+    setOutlineEditing(false);
+    setOutlineDraft("");
+    setOutlineSelectedVersion(null);
+    setOutlineError("");
+  }
+
+  /** 新任务开始或进入回看时清空编辑态，避免上一个 run 的草稿串台 */
+  function resetOutlineEditor() {
+    setOutlineEditing(false);
+    setOutlineDraft("");
+    setOutlineSelectedVersion(null);
+    setOutlineError("");
+    setOutlineNotice("");
+  }
+
+  async function handleOutlineRegenerate() {
+    const runId = currentRunId;
+    if (!runId) return;
+
+    const parsed = parseOutlineText(outlineDraft);
+    if (!parsed.ok) {
+      setOutlineError(parsed.error);
+      return;
+    }
+
+    setOutlineBusy(true);
+    setOutlineError("");
+    setOutlineNotice("");
+    try {
+      const res = await fetch(`/api/outline/${runId}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ outline: parsed.value }),
+      });
+      const data = (await res.json().catch(() => ({}))) as {
+        version?: OutlineVersion;
+        versions?: OutlineVersion[];
+        affected?: NodeId[];
+        error?: string;
+      };
+      if (!res.ok || !data.version || !data.versions) {
+        throw new Error(data.error ?? `重生成失败 ${res.status}`);
+      }
+
+      setOutlines((prev) => ({
+        ...prev,
+        [runId]: { versions: data.versions!, activeId: data.version!.id },
+      }));
+      setOutlineEditing(false);
+      setOutlineSelectedVersion(null);
+      setOutlineNotice(
+        `已提交「${data.version.id} ${data.version.label}」，重生成范围：${(
+          data.affected ?? []
+        )
+          .map((id) => NODE_META[id].name)
+          .join("、")}`,
+      );
+
+      const affected = data.affected ?? [];
+      setCopied((prev) => {
+        const next = { ...prev };
+        for (const id of affected) delete next[id];
+        return next;
+      });
+
+      // 下游已重新调度，重连 SSE 观察本次局部重生成
+      if (mode === "single") {
+        setRunStatus("running");
+        setReport(null);
+        connectSingle(runId);
+      } else {
+        const idx = activeTaskIndex;
+        setTasks((prev) =>
+          prev.map((t, i) =>
+            i === idx ? { ...t, status: "running", report: null } : t,
+          ),
+        );
+        connectTask(runId, idx);
+      }
+    } catch (err) {
+      setOutlineError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setOutlineBusy(false);
+    }
+  }
+
   async function handleCopy(nodeId: NodeId) {
     const text = currentNodes[nodeId].content;
     if (!text || copied[nodeId]) return;
@@ -1038,6 +1215,9 @@ export default function Home() {
       setCopied({});
       setNotice("");
       setReconnectNotice("");
+      // 历史快照里同样带着提纲版本链，回看态可查但不能编辑
+      applyOutlineSnapshot(snap);
+      resetOutlineEditor();
       setReviewing({
         runId: snap.runId,
         variantName: entry.variantName,
@@ -1062,6 +1242,7 @@ export default function Home() {
     setCopied({});
     setExpanded({});
     setNotice("");
+    resetOutlineEditor();
   }
 
   // 引导：结束并记住，下次不再自动弹出
@@ -1201,6 +1382,7 @@ export default function Home() {
     setNotice("");
     setTasks([]);
     setActiveTaskIndex(0);
+    resetOutlineEditor();
   }
 
   const showBatchInput = mode === "multi-topic" || mode === "multi-version";
@@ -2110,6 +2292,26 @@ export default function Home() {
                     >
                       中断
                     </button>
+                    {isPlanner &&
+                      !reviewing &&
+                      node.status === "completed" &&
+                      !outlineEditing && (
+                        <button
+                          onClick={() => beginOutlineEdit()}
+                          className={BTN_QUIET}
+                        >
+                          编辑提纲
+                        </button>
+                      )}
+                    {isPlanner && outlineEditing && (
+                      <button
+                        onClick={cancelOutlineEdit}
+                        disabled={outlineBusy}
+                        className={BTN_QUIET}
+                      >
+                        取消编辑
+                      </button>
+                    )}
                     {!isPlanner && (
                       <button
                         onClick={() => handleRerun(nodeId)}
@@ -2157,13 +2359,109 @@ export default function Home() {
                       </p>
                     )}
 
-                  <pre
-                    className={`overflow-auto whitespace-pre-wrap break-words rounded-lg border border-hairline bg-canvas p-3 text-xs leading-relaxed text-ink-2 ${
-                      isPlanner ? "max-h-64 font-mono text-[11px]" : "max-h-80"
-                    }`}
-                  >
-                    {node.content || "（暂无内容）"}
-                  </pre>
+                  {isPlanner ? (
+                    <div className="flex flex-col gap-2">
+                      {outlineVersions.length > 0 && (
+                        <div className="flex flex-wrap items-center gap-1.5">
+                          <span className="text-[11px] text-ink-3">提纲版本</span>
+                          {outlineVersions.map((version) => {
+                            const isActive =
+                              version.id === currentOutline?.activeId;
+                            const isSelected =
+                              outlineEditing &&
+                              version.id === outlineSelectedVersion;
+                            return (
+                              <button
+                                key={version.id}
+                                onClick={() => beginOutlineEdit(version)}
+                                disabled={!!reviewing || outlineBusy}
+                                title={`${version.label} · ${formatTime(version.createdAt)}`}
+                                className={`rounded-md border px-2 py-0.5 text-[11px] transition disabled:opacity-50 ${
+                                  isSelected
+                                    ? "border-accent bg-accent text-white"
+                                    : isActive
+                                      ? "border-emerald-200 bg-emerald-50 text-emerald-700"
+                                      : "border-hairline-strong bg-surface text-ink-2 hover:border-accent hover:text-accent"
+                                }`}
+                              >
+                                {version.id} · {version.label}
+                                {isActive ? " · 当前" : ""}
+                              </button>
+                            );
+                          })}
+                        </div>
+                      )}
+
+                      {outlineEditing ? (
+                        <>
+                          <textarea
+                            value={outlineDraft}
+                            onChange={(event) =>
+                              setOutlineDraft(event.target.value)
+                            }
+                            rows={16}
+                            spellCheck={false}
+                            className="max-h-96 w-full resize-y overflow-auto rounded-lg border border-hairline-strong bg-canvas p-3 font-mono text-[11px] leading-relaxed text-ink outline-none transition focus:border-accent"
+                          />
+                          {draftParse && !draftParse.ok && (
+                            <p className="text-[11px] text-red-600">
+                              JSON 语法错误：{draftParse.error}
+                            </p>
+                          )}
+                          {outlineError && (
+                            <p className="text-[11px] text-red-600">
+                              {outlineError}
+                            </p>
+                          )}
+                          <div className="flex flex-wrap items-center gap-2">
+                            <button
+                              onClick={() => void handleOutlineRegenerate()}
+                              disabled={
+                                outlineBusy ||
+                                isRunning ||
+                                !draftParse?.ok ||
+                                !outlineChanged
+                              }
+                              className="rounded-md bg-accent px-3 py-1.5 text-xs font-medium text-white transition hover:bg-accent-strong disabled:opacity-40"
+                            >
+                              {outlineBusy
+                                ? "提交中…"
+                                : "基于当前提纲重生成下游"}
+                            </button>
+                            {draftParse?.ok && !outlineChanged && (
+                              <span className="text-[11px] text-ink-3">
+                                与当前版本一致，修改后才能提交
+                              </span>
+                            )}
+                          </div>
+                          <p className="text-[11px] text-ink-3">
+                            仅重跑提纲有变化的渠道，未改动渠道保留原产出；不会重新执行策划 Agent
+                          </p>
+                        </>
+                      ) : (
+                        <>
+                          {outlineNotice && (
+                            <p className="text-[11px] text-emerald-600">
+                              {outlineNotice}
+                            </p>
+                          )}
+                          <pre className="max-h-64 overflow-auto whitespace-pre-wrap break-words rounded-lg border border-hairline bg-canvas p-3 font-mono text-[11px] leading-relaxed text-ink-2">
+                            {activeOutlineVersion
+                              ? JSON.stringify(
+                                  activeOutlineVersion.outline,
+                                  null,
+                                  2,
+                                )
+                              : node.content || "（暂无内容）"}
+                          </pre>
+                        </>
+                      )}
+                    </div>
+                  ) : (
+                    <pre className="max-h-80 overflow-auto whitespace-pre-wrap break-words rounded-lg border border-hairline bg-canvas p-3 text-xs leading-relaxed text-ink-2">
+                      {node.content || "（暂无内容）"}
+                    </pre>
+                  )}
                 </div>
               )}
             </section>
