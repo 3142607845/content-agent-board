@@ -75,6 +75,16 @@ export interface RunSummary {
   pending: number;
 }
 
+/** 一份提纲版本记录，支持人工编辑与历史回退 */
+export interface OutlineVersion {
+  id: string;
+  /** 展示用标签：策划原始 / 手动编辑 */
+  label: string;
+  source: "planner" | "manual";
+  createdAt: number;
+  outline: unknown;
+}
+
 /**
  * 全量快照。
  *
@@ -87,6 +97,10 @@ export interface RunSnapshot {
   variant: VariantKey | null;
   /** 本 run 选用的文风模板快照，按渠道存 */
   styles: Partial<Record<StyleChannel, StyleSnapshot>>;
+  /** 本次 run 保存的全部提纲版本，按创建顺序排列 */
+  outlineVersions: OutlineVersion[];
+  /** 当前生效的提纲版本 id；策划未完成时为 null */
+  outlineVersionId: string | null;
   status: RunStatus;
   createdAt: number;
   finishedAt: number | null;
@@ -120,6 +134,10 @@ export interface RunState {
   nodes: Record<NodeId, AgentNodeState>;
   /** 策划解析成功后的提纲对象，单节点重跑时复用 */
   outline: unknown | null;
+  /** 本次 run 的提纲版本链，人工编辑与回退都在这条链上操作 */
+  outlineVersions: OutlineVersion[];
+  /** 当前生效的提纲版本 */
+  activeOutlineVersionId: string | null;
   subscribers: Set<(event: StreamEvent) => void>;
   /** 每个节点独立的中断控制器 */
   controllers: Map<NodeId, AbortController>;
@@ -202,6 +220,8 @@ export function createRun(
     status: "running",
     nodes: initNodes(),
     outline: null,
+    outlineVersions: [],
+    activeOutlineVersionId: null,
     subscribers: new Set(),
     controllers: new Map(),
     createdAt: Date.now(),
@@ -243,6 +263,8 @@ export function buildSnapshot(run: RunState): RunSnapshot {
     topic: run.topic,
     variant: run.variant,
     styles: run.styles,
+    outlineVersions: run.outlineVersions,
+    outlineVersionId: run.activeOutlineVersionId,
     status: run.status,
     createdAt: run.createdAt,
     finishedAt: run.finishedAt,
@@ -279,7 +301,7 @@ async function execute(run: RunState): Promise<void> {
     return;
   }
 
-  await runParallel(run);
+  await runDownstream(run, DOWNSTREAM_NODE_IDS);
 }
 
 /**
@@ -449,7 +471,18 @@ async function runPlanner(run: RunState): Promise<boolean> {
     run.controllers.delete("planner");
 
     try {
-      run.outline = JSON.parse(text.trim());
+      const parsedOutline = JSON.parse(text.trim());
+      run.outline = parsedOutline;
+      // 策划原始提纲作为版本链起点，之后的人工编辑都在这条链上追加
+      const version: OutlineVersion = {
+        id: "v1",
+        label: "策划原始",
+        source: "planner",
+        createdAt: Date.now(),
+        outline: parsedOutline,
+      };
+      run.outlineVersions = [version];
+      run.activeOutlineVersionId = version.id;
       node.status = "completed";
       ensureUsage(node, input);
       endMetrics(node);
@@ -472,9 +505,21 @@ async function runPlanner(run: RunState): Promise<boolean> {
   return false;
 }
 
+/** 提纲渠道字段与下游节点的对应关系，局部重生成按这个粒度做 diff */
+const OUTLINE_CHANNELS: { key: string; nodeId: NodeId }[] = [
+  { key: "longForm", nodeId: "longform" },
+  { key: "script", nodeId: "script" },
+  { key: "xhs", nodeId: "xhs" },
+  { key: "image", nodeId: "image" },
+];
+
 /** 从策划提纲里取某个渠道的片段，取不到就返回 null，交给 Agent 自行发挥 */
 function getSection(run: RunState, key: string): unknown {
-  const parsed = run.outline as { outline?: Record<string, unknown> } | null;
+  return outlineSection(run.outline, key);
+}
+
+function outlineSection(outline: unknown, key: string): unknown {
+  const parsed = outline as { outline?: Record<string, unknown> } | null;
   return parsed?.outline?.[key] ?? null;
 }
 
@@ -490,25 +535,47 @@ function buildSectionInput(
   return style ? `${base}${buildStyleBlock(style)}` : base;
 }
 
-async function runParallel(run: RunState): Promise<void> {
-  await Promise.allSettled([
-    runTextNode(
-      run,
-      "longform",
-      new LongformAgent(),
-      getSection(run, "longForm"),
-      run.styles.longform,
-    ),
-    runTextNode(
-      run,
-      "script",
-      new ScriptAgent(),
-      getSection(run, "script"),
-      run.styles.script,
-    ),
-    runTextNode(run, "xhs", new XhsAgent(), getSection(run, "xhs"), run.styles.xhs),
-    runImageNode(run, getSection(run, "image")),
-  ]);
+const DOWNSTREAM_NODE_IDS: NodeId[] = ["longform", "script", "xhs", "image"];
+
+/**
+ * 跑指定的下游节点，全部结束后统一收尾。
+ *
+ * 正常流水线传 4 个节点；基于提纲重生成时只传受影响的渠道，
+ * 未传入的节点保持原有产出与指标不动。
+ */
+async function runDownstream(run: RunState, nodeIds: NodeId[]): Promise<void> {
+  const tasks: Promise<void>[] = [];
+  for (const nodeId of nodeIds) {
+    if (nodeId === "longform") {
+      tasks.push(
+        runTextNode(
+          run,
+          "longform",
+          new LongformAgent(),
+          getSection(run, "longForm"),
+          run.styles.longform,
+        ),
+      );
+    } else if (nodeId === "script") {
+      tasks.push(
+        runTextNode(
+          run,
+          "script",
+          new ScriptAgent(),
+          getSection(run, "script"),
+          run.styles.script,
+        ),
+      );
+    } else if (nodeId === "xhs") {
+      tasks.push(
+        runTextNode(run, "xhs", new XhsAgent(), getSection(run, "xhs"), run.styles.xhs),
+      );
+    } else if (nodeId === "image") {
+      tasks.push(runImageNode(run, getSection(run, "image")));
+    }
+  }
+
+  await Promise.allSettled(tasks);
 
   const status: RunStatus =
     run.status === "aborted"
@@ -754,6 +821,16 @@ export function stopRun(runId: string, nodeId?: NodeId): boolean {
   return true;
 }
 
+/** 把节点重置成待跑状态；旧的耗时与用量属于上一轮，重跑要清掉 */
+function resetNode(node: AgentNodeState): void {
+  node.status = "pending";
+  node.content = "";
+  node.imageUrl = undefined;
+  node.error = undefined;
+  node.attempt = 0;
+  node.metrics = undefined;
+}
+
 /**
  * 单节点重跑。
  *
@@ -770,13 +847,7 @@ export function rerunNode(runId: string, nodeId: NodeId): boolean {
   const node = run.nodes[nodeId];
   if (!node || node.status === "running") return false;
 
-  node.status = "pending";
-  node.content = "";
-  node.imageUrl = undefined;
-  node.error = undefined;
-  node.attempt = 0;
-  // 旧的耗时和用量属于上一轮，重跑要清掉
-  node.metrics = undefined;
+  resetNode(node);
 
   if (run.status === "failed" || run.status === "completed" || run.status === "aborted") {
     run.status = "running";
@@ -816,4 +887,105 @@ export function rerunNode(runId: string, nodeId: NodeId): boolean {
   }
 
   return true;
+}
+
+/** 人工提交的提纲长度上限，防止误粘贴超长内容 */
+export const OUTLINE_MAX_CHARS = 20_000;
+
+export interface OutlineApplyResult {
+  ok: boolean;
+  error?: string;
+  /** 失败原因分类，接口层据此映射 HTTP 状态码 */
+  code?: "not_found" | "busy" | "invalid";
+  version?: OutlineVersion;
+  versions?: OutlineVersion[];
+  affected?: NodeId[];
+}
+
+/**
+ * 基于人工编辑的提纲重生成下游。
+ *
+ * - 不重新执行策划 Agent，直接把提交内容换成当前生效提纲
+ * - 按渠道 diff 只重置受影响的节点，其余节点产出与指标原样保留
+ * - 提交内容与某个历史版本一致时直接激活该版本，回退不会产生重复版本
+ */
+export function regenerateFromOutline(
+  runId: string,
+  outline: unknown,
+): OutlineApplyResult {
+  const run = runs.get(runId);
+  if (!run) return { ok: false, code: "not_found", error: "run 不存在或已过期" };
+
+  if (run.nodes.planner.status !== "completed" || !run.outline) {
+    return { ok: false, code: "invalid", error: "策划提纲尚未生成，无法重生成下游" };
+  }
+
+  if (
+    run.status === "running" ||
+    NODE_IDS.some((id) => run.nodes[id].status === "running")
+  ) {
+    return { ok: false, code: "busy", error: "流水线运行中，请等待当前节点结束" };
+  }
+
+  if (!outline || typeof outline !== "object" || Array.isArray(outline)) {
+    return { ok: false, code: "invalid", error: "提纲必须是 JSON 对象" };
+  }
+  const section = (outline as { outline?: unknown }).outline;
+  if (!section || typeof section !== "object" || Array.isArray(section)) {
+    return { ok: false, code: "invalid", error: "提纲缺少 outline 对象" };
+  }
+
+  const serialized = JSON.stringify(outline);
+  if (serialized.length > OUTLINE_MAX_CHARS) {
+    return {
+      ok: false,
+      code: "invalid",
+      error: `提纲过长（上限 ${OUTLINE_MAX_CHARS} 字符）`,
+    };
+  }
+
+  const affected = OUTLINE_CHANNELS.filter(
+    ({ key }) =>
+      JSON.stringify(outlineSection(run.outline, key)) !==
+      JSON.stringify(outlineSection(outline, key)),
+  ).map(({ nodeId }) => nodeId);
+
+  if (affected.length === 0) {
+    return { ok: false, code: "invalid", error: "提纲没有变化，无需重生成下游" };
+  }
+
+  let version = run.outlineVersions.find(
+    (item) => JSON.stringify(item.outline) === serialized,
+  );
+  if (!version) {
+    version = {
+      id: `v${run.outlineVersions.length + 1}`,
+      label: "手动编辑",
+      source: "manual",
+      createdAt: Date.now(),
+      outline,
+    };
+    run.outlineVersions.push(version);
+  }
+
+  run.outline = outline;
+  run.activeOutlineVersionId = version.id;
+
+  for (const nodeId of affected) {
+    resetNode(run.nodes[nodeId]);
+  }
+
+  run.status = "running";
+  run.finishedAt = null;
+  run.summary = null;
+  run.report = null;
+
+  void runDownstream(run, affected);
+
+  return {
+    ok: true,
+    version,
+    versions: [...run.outlineVersions],
+    affected,
+  };
 }
