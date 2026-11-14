@@ -11,6 +11,7 @@ import type {
 import { formatDuration, formatTokens, type RunReport } from "@/lib/report";
 import { VARIANTS, type VariantKey } from "@/lib/variants";
 import type { HistoryBatch, HistoryRunEntry } from "@/lib/history";
+import BackgroundScene from "./background-scene";
 
 const NODE_ORDER: NodeId[] = ["planner", "longform", "script", "xhs", "image"];
 
@@ -950,6 +951,9 @@ export default function Home() {
 
   return (
     <>
+      {/* 3D 氛围背景：最底层装饰，指针事件穿透，不参与任何交互 */}
+      <BackgroundScene active={isRunning} />
+
       <header className="sticky top-0 z-20 border-b border-hairline bg-surface/85 backdrop-blur">
         <div className="mx-auto flex w-full max-w-6xl flex-wrap items-center justify-between gap-3 px-6 py-3">
           <div className="flex items-center gap-3">
