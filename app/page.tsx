@@ -17,6 +17,15 @@ import type {
 } from "@/lib/orchestrator";
 import { formatDuration, formatTokens, type RunReport } from "@/lib/report";
 import { VARIANTS, type VariantKey } from "@/lib/variants";
+import {
+  DEFAULT_STYLE_BY_CHANNEL,
+  STYLE_CHANNELS,
+  STYLE_NAME_MAX,
+  STYLE_PROMPT_MAX,
+  STYLE_SUMMARY_MAX,
+  type StyleChannel,
+  type StyleTemplate,
+} from "@/lib/styles";
 import type { HistoryBatch, HistoryRunEntry } from "@/lib/history";
 import BackgroundScene from "./background-scene";
 
@@ -186,7 +195,18 @@ interface TaskResult {
 interface ReviewingState {
   runId: string;
   variantName: string | null;
+  /** 本次 run 选用的文风模板名，历史快照里读出来 */
+  styleNames: string[];
   finishedAt: number | null;
+}
+
+/** 模板编辑态：id 为 null 表示新建 */
+interface StyleDraft {
+  id: string | null;
+  channel: StyleChannel;
+  name: string;
+  summary: string;
+  prompt: string;
 }
 
 function emptyNodes(): Record<NodeId, AgentNodeState> {
@@ -232,10 +252,11 @@ function ReportCard({ report, title = "本次流水线执行报告" }: { report:
       </p>
 
       <div className="mt-3 overflow-x-auto">
-        <table className="w-full min-w-[620px] text-left text-xs tabular-nums">
+        <table className="w-full min-w-[720px] text-left text-xs tabular-nums">
           <thead className="text-ink-3">
             <tr>
               <th className="py-1 pr-3 font-normal">节点</th>
+              <th className="py-1 pr-3 font-normal">文风</th>
               <th className="py-1 pr-3 font-normal">模型</th>
               <th className="py-1 pr-3 font-normal">状态</th>
               <th className="py-1 pr-3 font-normal">耗时</th>
@@ -248,6 +269,9 @@ function ReportCard({ report, title = "本次流水线执行报告" }: { report:
             {report.nodes.map((n) => (
               <tr key={n.nodeId} className="border-t border-hairline">
                 <td className="py-1.5 pr-3 font-medium text-ink">{n.name}</td>
+                <td className="max-w-[10rem] truncate py-1.5 pr-3 text-ink-2">
+                  {n.styleName ?? "—"}
+                </td>
                 <td className="py-1.5 pr-3 font-mono text-[11px] text-ink-3">
                   {n.model}
                 </td>
@@ -390,6 +414,16 @@ export default function Home() {
   const [historyOpen, setHistoryOpen] = useState(false);
   const [reviewing, setReviewing] = useState<ReviewingState | null>(null);
 
+  // 风格模板：内置 + 自定义全量列表，按渠道过滤使用
+  const [styleTemplates, setStyleTemplates] = useState<StyleTemplate[]>([]);
+  const [styleSelection, setStyleSelection] = useState<
+    Partial<Record<StyleChannel, string>>
+  >({});
+  const [stylePanelOpen, setStylePanelOpen] = useState(false);
+  const [styleDraft, setStyleDraft] = useState<StyleDraft | null>(null);
+  const [styleError, setStyleError] = useState("");
+  const [styleBusy, setStyleBusy] = useState(false);
+
   // 首次进入的三步引导：localStorage 只记一次，也可从头部按钮重新唤起
   const [tourStep, setTourStep] = useState(0);
   const [tourLayout, setTourLayout] = useState<{
@@ -416,6 +450,35 @@ export default function Home() {
   useEffect(() => {
     void loadHistory();
   }, [loadHistory]);
+
+  const loadStyles = useCallback(async () => {
+    try {
+      const res = await fetch("/api/styles", { cache: "no-store" });
+      if (!res.ok) return;
+      const data = (await res.json()) as { templates?: StyleTemplate[] };
+      const templates = data.templates ?? [];
+      setStyleTemplates(templates);
+      // 已有选择保持不变；没有选择时回落到该渠道的内置默认模板
+      setStyleSelection((prev) => {
+        const next = { ...prev };
+        for (const ch of STYLE_CHANNELS) {
+          if (next[ch.key]) continue;
+          const fallback =
+            templates.find(
+              (t) => t.id === DEFAULT_STYLE_BY_CHANNEL[ch.key] && t.channel === ch.key,
+            ) ?? templates.find((t) => t.channel === ch.key);
+          if (fallback) next[ch.key] = fallback.id;
+        }
+        return next;
+      });
+    } catch {
+      // 模板列表取不到不影响主流程
+    }
+  }, []);
+
+  useEffect(() => {
+    void loadStyles();
+  }, [loadStyles]);
 
   // 首次访问自动弹引导；已看过或存储不可用时安静跳过
   useEffect(() => {
@@ -769,7 +832,7 @@ export default function Home() {
       const res = await fetch("/api/run", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ topic: value }),
+        body: JSON.stringify({ topic: value, styles: stylesPayload() }),
       });
       const data = (await res.json()) as { runId?: string; error?: string };
       if (!res.ok || !data.runId) throw new Error(data.error ?? `启动失败 ${res.status}`);
@@ -842,6 +905,7 @@ export default function Home() {
             topic: initial[i].topic,
             ...(initial[i].variant ? { variant: initial[i].variant } : {}),
             batchId: batchUuid,
+            styles: stylesPayload(),
           }),
         });
         const data = (await res.json()) as { runId?: string; error?: string };
@@ -977,6 +1041,10 @@ export default function Home() {
       setReviewing({
         runId: snap.runId,
         variantName: entry.variantName,
+        // 老快照没有 styles 字段，兜底成空数组
+        styleNames: Object.values(snap.styles ?? {})
+          .map((style) => style?.name)
+          .filter((name): name is string => Boolean(name)),
         finishedAt: snap.finishedAt,
       });
       setHistoryOpen(false);
@@ -1030,6 +1098,101 @@ export default function Home() {
     setTopic(example);
   }
 
+  // —— 风格模板管理 ——
+  function openNewStyle(channel: StyleChannel) {
+    setStyleError("");
+    setStyleDraft({ id: null, channel, name: "", summary: "", prompt: "" });
+  }
+
+  function openEditStyle(template: StyleTemplate) {
+    setStyleError("");
+    setStyleDraft({
+      id: template.id,
+      channel: template.channel,
+      name: template.name,
+      summary: template.summary,
+      prompt: template.prompt,
+    });
+  }
+
+  // 内置模板只读，复制一份成自定义模板后再改
+  function copyStyle(template: StyleTemplate) {
+    setStyleError("");
+    setStyleDraft({
+      id: null,
+      channel: template.channel,
+      name: `${template.name} 副本`.slice(0, STYLE_NAME_MAX),
+      summary: template.summary,
+      prompt: template.prompt,
+    });
+  }
+
+  async function saveStyle() {
+    if (!styleDraft) return;
+    setStyleBusy(true);
+    setStyleError("");
+    try {
+      const editing = styleDraft.id !== null;
+      const res = await fetch(
+        editing ? `/api/styles/${styleDraft.id}` : "/api/styles",
+        {
+          method: editing ? "PUT" : "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            channel: styleDraft.channel,
+            name: styleDraft.name,
+            summary: styleDraft.summary,
+            prompt: styleDraft.prompt,
+          }),
+        },
+      );
+      const data = (await res.json().catch(() => ({}))) as {
+        template?: StyleTemplate;
+        error?: string;
+      };
+      if (!res.ok || !data.template) {
+        throw new Error(data.error ?? `保存失败 ${res.status}`);
+      }
+      setStyleDraft(null);
+      await loadStyles();
+    } catch (err) {
+      setStyleError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setStyleBusy(false);
+    }
+  }
+
+  async function removeStyle(template: StyleTemplate) {
+    if (!window.confirm(`删除模板「${template.name}」？删除后不可恢复。`)) return;
+    setStyleError("");
+    try {
+      const res = await fetch(`/api/styles/${template.id}`, { method: "DELETE" });
+      if (!res.ok) {
+        const data = (await res.json().catch(() => ({}))) as { error?: string };
+        throw new Error(data.error ?? `删除失败 ${res.status}`);
+      }
+      // 被删的正好是当前选中项时，回落到同渠道的内置默认模板
+      setStyleSelection((prev) =>
+        prev[template.channel] === template.id
+          ? { ...prev, [template.channel]: DEFAULT_STYLE_BY_CHANNEL[template.channel] }
+          : prev,
+      );
+      await loadStyles();
+    } catch (err) {
+      setStyleError(err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  /** 只把真正选中的模板发给后端，空选项表示沿用 Agent 默认文风 */
+  function stylesPayload(): Partial<Record<StyleChannel, string>> {
+    const payload: Partial<Record<StyleChannel, string>> = {};
+    for (const ch of STYLE_CHANNELS) {
+      const selected = styleSelection[ch.key];
+      if (selected) payload[ch.key] = selected;
+    }
+    return payload;
+  }
+
   function switchMode(next: Mode) {
     if (isRunning) return;
     // 回看态下切模式视为离开回看，避免历史内容与新模式的空态混在一起
@@ -1042,6 +1205,7 @@ export default function Home() {
 
   const showBatchInput = mode === "multi-topic" || mode === "multi-version";
   const allExpanded = NODE_ORDER.every((id) => expanded[id]);
+  const customStyleCount = styleTemplates.filter((t) => !t.builtin).length;
 
   // 批量模式全局进度：只把 completed 计入已完成，失败/中断单独统计
   const batchTotal = tasks.length;
@@ -1137,6 +1301,16 @@ export default function Home() {
               className={`${BTN_QUIET} px-3 py-1.5`}
             >
               使用引导
+            </button>
+            <button
+              onClick={() => {
+                setStylePanelOpen((prev) => !prev);
+                if (!stylePanelOpen) void loadStyles();
+              }}
+              className={`${BTN_QUIET} px-3 py-1.5`}
+            >
+              风格模板
+              {customStyleCount > 0 ? ` (${customStyleCount})` : ""}
             </button>
             <button
               onClick={() => {
@@ -1279,6 +1453,215 @@ export default function Home() {
         </section>
       )}
 
+      {/* 风格模板库：三个渠道分区管理，内置只读、自定义可增删改 */}
+      {stylePanelOpen && (
+        <section className={`${CARD} flex flex-col gap-3 p-4`}>
+          <div className="flex flex-wrap items-start justify-between gap-2">
+            <div>
+              <h2 className="text-sm font-semibold text-ink">风格模板库</h2>
+              <p className="text-xs text-ink-3">
+                每个渠道一套文风描述，运行时与控制台下拉配合使用；提纲维度与文风互相独立，可自由组合
+              </p>
+            </div>
+            <button
+              onClick={() => void loadStyles()}
+              className="text-xs text-ink-3 transition hover:text-ink"
+            >
+              刷新
+            </button>
+          </div>
+
+          {/* 编辑区：新建与编辑共用一张表单 */}
+          {styleDraft && (
+            <div className="panel-in rounded-lg border border-accent/30 bg-accent/5 p-3">
+              <div className="flex items-center justify-between">
+                <h3 className="text-xs font-semibold text-ink">
+                  {styleDraft.id ? "编辑自定义模板" : "新建自定义模板"}
+                </h3>
+                <button
+                  onClick={() => {
+                    setStyleDraft(null);
+                    setStyleError("");
+                  }}
+                  className="text-xs text-ink-3 transition hover:text-ink"
+                >
+                  取消
+                </button>
+              </div>
+              <div className="mt-2 grid gap-2 md:grid-cols-2">
+                <label className="flex flex-col gap-1">
+                  <span className="text-[11px] text-ink-3">渠道</span>
+                  <select
+                    value={styleDraft.channel}
+                    onChange={(event) =>
+                      setStyleDraft({
+                        ...styleDraft,
+                        channel: event.target.value as StyleChannel,
+                      })
+                    }
+                    disabled={styleDraft.id !== null}
+                    className="rounded-md border border-hairline-strong bg-surface px-2.5 py-1.5 text-xs text-ink outline-none transition focus:border-accent disabled:bg-canvas disabled:text-ink-3"
+                  >
+                    {STYLE_CHANNELS.map((ch) => (
+                      <option key={ch.key} value={ch.key}>
+                        {ch.label}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <label className="flex flex-col gap-1">
+                  <span className="text-[11px] text-ink-3">
+                    模板名称（最多 {STYLE_NAME_MAX} 字）
+                  </span>
+                  <input
+                    value={styleDraft.name}
+                    maxLength={STYLE_NAME_MAX}
+                    onChange={(event) =>
+                      setStyleDraft({ ...styleDraft, name: event.target.value })
+                    }
+                    placeholder="例如：小红书深夜情绪风"
+                    className="rounded-md border border-hairline-strong bg-surface px-2.5 py-1.5 text-xs text-ink outline-none transition placeholder:text-ink-3 focus:border-accent"
+                  />
+                </label>
+                <label className="flex flex-col gap-1 md:col-span-2">
+                  <span className="text-[11px] text-ink-3">
+                    一句话说明（最多 {STYLE_SUMMARY_MAX} 字）
+                  </span>
+                  <input
+                    value={styleDraft.summary}
+                    maxLength={STYLE_SUMMARY_MAX}
+                    onChange={(event) =>
+                      setStyleDraft({ ...styleDraft, summary: event.target.value })
+                    }
+                    placeholder="例如：第一人称情绪流，适合深夜话题"
+                    className="rounded-md border border-hairline-strong bg-surface px-2.5 py-1.5 text-xs text-ink outline-none transition placeholder:text-ink-3 focus:border-accent"
+                  />
+                </label>
+                <label className="flex flex-col gap-1 md:col-span-2">
+                  <span className="text-[11px] text-ink-3">
+                    文风 / 格式 / 排版 / 标签描述（最多 {STYLE_PROMPT_MAX} 字，会原样注入 Agent）
+                  </span>
+                  <textarea
+                    value={styleDraft.prompt}
+                    maxLength={STYLE_PROMPT_MAX}
+                    rows={6}
+                    onChange={(event) =>
+                      setStyleDraft({ ...styleDraft, prompt: event.target.value })
+                    }
+                    placeholder={"文风：……\n格式：……\n排版：……\n标签：……"}
+                    className="rounded-md border border-hairline-strong bg-surface px-2.5 py-2 text-xs leading-relaxed text-ink outline-none transition placeholder:text-ink-3 focus:border-accent"
+                  />
+                </label>
+              </div>
+              {styleError && (
+                <p className="mt-2 text-xs text-red-600">{styleError}</p>
+              )}
+              <div className="mt-3 flex flex-wrap items-center gap-2">
+                <button
+                  onClick={() => void saveStyle()}
+                  disabled={
+                    styleBusy ||
+                    !styleDraft.name.trim() ||
+                    !styleDraft.prompt.trim()
+                  }
+                  className="rounded-md bg-accent px-3 py-1.5 text-xs font-medium text-white transition hover:bg-accent-strong disabled:opacity-40"
+                >
+                  {styleBusy ? "保存中…" : "保存模板"}
+                </button>
+                <span className="text-[11px] text-ink-3">
+                  保存后会出现在控制台的渠道下拉里
+                </span>
+              </div>
+            </div>
+          )}
+
+          <div className="grid gap-3 md:grid-cols-3">
+            {STYLE_CHANNELS.map((ch) => {
+              const list = styleTemplates.filter((t) => t.channel === ch.key);
+              return (
+                <div
+                  key={ch.key}
+                  className="flex flex-col gap-2 rounded-lg border border-hairline bg-canvas/40 p-3"
+                >
+                  <div className="flex items-start justify-between gap-2">
+                    <div>
+                      <h3 className="text-xs font-semibold text-ink">{ch.label}</h3>
+                      <p className="text-[11px] text-ink-3">{ch.hint}</p>
+                    </div>
+                    <button
+                      onClick={() => openNewStyle(ch.key)}
+                      className="shrink-0 rounded-md border border-hairline-strong bg-surface px-2 py-1 text-[11px] text-ink-2 transition hover:border-accent hover:text-accent"
+                    >
+                      新建
+                    </button>
+                  </div>
+                  <ul className="flex flex-col gap-2">
+                    {list.map((template) => (
+                      <li
+                        key={template.id}
+                        className="rounded-md border border-hairline bg-surface p-2.5"
+                      >
+                        <div className="flex flex-wrap items-center gap-1.5">
+                          <span className="truncate text-xs font-medium text-ink">
+                            {template.name}
+                          </span>
+                          {template.builtin && (
+                            <span className="shrink-0 rounded border border-hairline bg-canvas px-1 py-0.5 text-[10px] text-ink-3">
+                              内置
+                            </span>
+                          )}
+                          {styleSelection[ch.key] === template.id && (
+                            <span className="shrink-0 rounded bg-accent/10 px-1 py-0.5 text-[10px] text-accent">
+                              使用中
+                            </span>
+                          )}
+                        </div>
+                        <p className="mt-1 truncate text-[11px] text-ink-3">
+                          {template.summary}
+                        </p>
+                        <p className="mt-1 line-clamp-2 whitespace-pre-line text-[11px] leading-relaxed text-ink-2">
+                          {template.prompt}
+                        </p>
+                        <div className="mt-2 flex items-center gap-3 text-[11px]">
+                          <button
+                            onClick={() => copyStyle(template)}
+                            className="text-ink-2 transition hover:text-accent"
+                          >
+                            复制
+                          </button>
+                          {!template.builtin && (
+                            <>
+                              <button
+                                onClick={() => openEditStyle(template)}
+                                className="text-ink-2 transition hover:text-accent"
+                              >
+                                编辑
+                              </button>
+                              <button
+                                onClick={() => void removeStyle(template)}
+                                className="text-ink-3 transition hover:text-red-600"
+                              >
+                                删除
+                              </button>
+                            </>
+                          )}
+                        </div>
+                      </li>
+                    ))}
+                    {list.length === 0 && (
+                      <li className="text-[11px] text-ink-3">该渠道暂无模板</li>
+                    )}
+                  </ul>
+                </div>
+              );
+            })}
+          </div>
+          {styleError && !styleDraft && (
+            <p className="text-xs text-red-600">{styleError}</p>
+          )}
+        </section>
+      )}
+
       {/* 回看态提示：只读展示，不建立 SSE */}
       {reviewing && (
         <div className="flex flex-wrap items-center gap-3 rounded-xl border border-blue-200 bg-blue-50/70 px-4 py-2.5 text-sm">
@@ -1287,6 +1670,11 @@ export default function Home() {
             {reviewing.variantName ? `${reviewing.variantName} · ` : ""}
             {reviewing.finishedAt ? formatTime(reviewing.finishedAt) : ""}
           </span>
+          {reviewing.styleNames.length > 0 && (
+            <span className="text-xs text-blue-600">
+              文风：{reviewing.styleNames.join(" / ")}
+            </span>
+          )}
           <span className="text-xs text-blue-600">
             只读快照，没有实时流；重新生成会创建新任务
           </span>
@@ -1431,6 +1819,44 @@ export default function Home() {
               </div>
             </div>
           )}
+
+          {/* 风格模板：每个下游内容 Agent 独立选文风，启动时快照进 run */}
+          <div className="rounded-lg border border-hairline bg-canvas/50 p-3">
+            <div className="flex flex-wrap items-baseline gap-2">
+              <span className="text-[11px] font-medium text-ink-2">风格模板</span>
+              <span className="text-[11px] text-ink-3">
+                三个内容 Agent 各自选文风，与提纲维度自由组合
+              </span>
+            </div>
+            <div className="mt-2 grid gap-2 sm:grid-cols-3">
+              {STYLE_CHANNELS.map((ch) => (
+                <label key={ch.key} className="flex flex-col gap-1">
+                  <span className="text-[11px] text-ink-3">{ch.label}</span>
+                  <select
+                    value={styleSelection[ch.key] ?? ""}
+                    onChange={(event) =>
+                      setStyleSelection((prev) => ({
+                        ...prev,
+                        [ch.key]: event.target.value,
+                      }))
+                    }
+                    disabled={isRunning}
+                    className="w-full rounded-md border border-hairline-strong bg-surface px-2 py-1.5 text-xs text-ink outline-none transition focus:border-accent disabled:bg-canvas disabled:text-ink-3"
+                  >
+                    <option value="">不使用模板</option>
+                    {styleTemplates
+                      .filter((t) => t.channel === ch.key)
+                      .map((t) => (
+                        <option key={t.id} value={t.id}>
+                          {t.name}
+                          {t.builtin ? "（内置）" : ""}
+                        </option>
+                      ))}
+                  </select>
+                </label>
+              ))}
+            </div>
+          </div>
 
           {/* 示例选题：不知道写什么时一键填入 */}
           <div className="flex flex-wrap items-center gap-2 border-t border-dashed border-hairline pt-3">
@@ -1611,7 +2037,14 @@ export default function Home() {
                 </span>
               </button>
 
-              <p className="text-xs text-ink-3">{NODE_META[nodeId].desc}</p>
+              <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+                <p className="text-xs text-ink-3">{NODE_META[nodeId].desc}</p>
+                {node.style && (
+                  <span className="max-w-full truncate rounded border border-indigo-100 bg-indigo-50 px-1.5 py-0.5 text-[10px] text-indigo-600">
+                    风格 · {node.style.name}
+                  </span>
+                )}
+              </div>
 
               {/* 执行指标：耗时 / token / 重试，折叠态也展示 */}
               {node.metrics && (

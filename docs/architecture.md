@@ -20,6 +20,8 @@
 
 4 个内容 Agent 之间无依赖，并行执行；但它们都依赖策划 Agent 的输出，构成真实的上下游协同关系。
 
+下游三个文本 Agent 的入参是「策划提纲 + 运行时选定的风格模板」：提纲决定写什么（角度、结构、侧重点），风格模板决定怎么写（文风、格式、排版、标签），两者互相独立、可自由组合。配图 Agent 只使用提纲里的配图描述，不参与风格模板。
+
 ### 失败处理规则
 
 1. **策划节点失败（含自动重试后的失败）**：整个流水线阻塞，后置 4 个节点全部不启动。前端看板提示「策划提纲生成失败，无法继续生成内容」。
@@ -110,10 +112,11 @@
   runId: string;
   topic: string;
   variant: "analysis" | "story" | "beginner" | null;
+  styles: { longform?: StyleSnapshot; script?: StyleSnapshot; xhs?: StyleSnapshot };
   status: "running" | "completed" | "failed" | "aborted";
   createdAt: number;
   finishedAt: number | null;
-  nodes: Record<NodeId, AgentNodeState>; // 含 content / imageUrl / error / attempt / model / metrics
+  nodes: Record<NodeId, AgentNodeState>; // 含 content / imageUrl / error / attempt / model / style / metrics
   summary: RunSummary | null;            // 终态才有值
   report: RunReport | null;              // 终态才有值
 }
@@ -187,9 +190,11 @@ token 来源：请求体带 `stream_options: { include_usage: true }`，方舟�
 
 | 模式 | 行为 | 请求差异 |
 |---|---|---|
-| 单次生成 | 一个选题跑一条流水线 | 只传 `topic` |
-| 批量选题 | 多行输入（最多 3 个）逐条跑 | 每条 run 只传 `topic` |
-| 多版生成 | 同一选题跑 3 次，每次注入一个创作维度 | 额外传 `variant` |
+| 单次生成 | 一个选题跑一条流水线 | 只传 `topic`（可带 `styles`） |
+| 批量选题 | 多行输入（最多 3 个）逐条跑 | 每条 run 传 `topic`（可带 `styles`） |
+| 多版生成 | 同一选题跑 3 次，每次注入一个创作维度 | 额外传 `variant`（可带 `styles`） |
+
+三种模式都可以额外传 `styles: { longform?, script?, xhs? }`，值为风格模板 id。风格模板与创作维度是两个正交维度：维度只影响策划提纲的结构，风格只影响下游三个文本 Agent 的写法，可以任意组合。
 
 前端用 `tasks[]` 维护批量结果，每个元素含自己的 `nodes` 与 `runId`，tab 切换时只切展示数据源，不重连。
 
@@ -255,6 +260,52 @@ page.tsx (variant)
 - 部署到 Vercel 等只读环境时该功能自动降级为不可用
 - 落盘内容是完整文本，单条约 10–40 KB，5 批上限下磁盘占用可忽略
 
+## 平台风格模板库
+
+原先三个渠道的写作风格硬编码在各自 Agent 的 system prompt 里，用户想换文风只能改代码。本轮把「文风」抽成可管理的运行时输入：提纲决定写什么，风格模板决定怎么写。
+
+**数据模型（`lib/styles.ts`）**
+
+- `StyleChannel = "longform" | "script" | "xhs"`，一个渠道对应一个下游文本节点
+- `StyleTemplate { id, channel, name, summary, prompt, builtin, createdAt, updatedAt }`
+- `prompt` 是「文风 / 格式 / 排版 / 标签」的自然语言描述，只作为提示词内容，不参与任何逻辑判断
+- 内置 6 套模板（每渠道 2 套）写在代码里，永远可用；`builtin: true` 只读，可「复制为自定义模板」后再改
+
+**存储与接口**
+
+自定义模板落盘 `data/styles.json`，与历史快照同一套容错思路：写盘失败只记日志，不影响流水线。
+
+| 接口 | 说明 |
+|---|---|
+| `GET /api/styles` | 内置 + 自定义全量列表，前端按渠道过滤 |
+| `POST /api/styles` | 新建自定义模板 |
+| `PUT /api/styles/[id]` | 编辑自定义模板，内置模板返回 403 |
+| `DELETE /api/styles/[id]` | 删除自定义模板，内置模板返回 403 |
+
+校验规则：名称 ≤ 24 字、说明 ≤ 60 字、内容 ≤ 2000 字、渠道必须合法、同渠道不允许重名、自定义模板上限 30 套。
+
+**注入路径**
+
+```
+page.tsx (styles: { channel: templateId })
+  → POST /api/run（resolveStyles 解析成快照，模板不存在或渠道不符返回 400）
+  → createRun(topic, variant, batchId, styles) 存入 RunState.styles
+  → runTextNode(..., styles[channel])
+  → buildSectionInput：选题 + 专属提纲 + 风格块
+```
+
+风格块放在入参末尾，并明确「与默认写作习惯冲突时以模板为准」，避免 Agent 自身的 system prompt 与模板各说各话。
+
+**为什么存快照而不是存 id**
+
+模板随时可能被编辑或删除，但已经跑完的任务必须能解释「当时用的哪套文风」。所以 `RunState.styles` 存 `{ id, name, prompt }` 快照，节点上再存 `{ id, name }` 供卡片徽标与报告展示；历史回看读的是落盘快照，不受模板后续变动影响。单节点重跑复用同一份快照。
+
+**前端**
+
+- header「风格模板」按钮 → 三栏面板（公众号 / 短视频 / 小红书），支持新建、编辑、删除、复制
+- 运行控制台三个下拉，分别对应三个下游 Agent；运行中锁定，随 run 快照落盘
+- 卡片标题下显示「风格 · xxx」徽标，执行报告新增「文风」列
+
 ## 技术架构
 
 ```
@@ -275,6 +326,7 @@ page.tsx (variant)
 │ POST /api/rerun/:nodeId  重跑单个节点                  │
 │ GET  /api/stream/:runId  SSE：全量快照 + 增量事件       │
 │ GET  /api/run/:runId     一次性取快照与执行报告          │
+│ GET  /api/styles         风格模板列表；POST/PUT/DELETE 管理 │
 └──────────────────────┬──────────────────────────────┘
                        ▼
 ┌─────────────────────────────────────────────────────┐
@@ -307,6 +359,8 @@ page.tsx (variant)
 6. **执行报告随快照落盘**：报告由 `buildRunReport` 在内存中生成，写回 `RunState.report`，随 `run:done` 下发，并可通过 `GET /api/run/[runId]` 取。最初只在内存保留、不写文件；新增历史回看后改为随快照落到 `data/runs/`——内存态在进程重启后必然丢失，而「隔天打开看上一轮结果」正是回看的主要场景。该目录已加入 `.gitignore`，不污染仓库；写盘失败只记日志，不影响流水线。报告里刻意保留 `hasEstimated` 标记：服务端没返回 usage 时宁可标注「估算」，也不把估算值当真实值展示。
 7. **并行加速比作为架构价值的量化指标**：报告不只列各节点耗时，还计算「4 路串行耗时之和 ÷ 实际墙钟时间」。这是唯一能用一个数字说明「多 Agent 并行」比单线程串行快多少的地方。
 8. **历史记录按批次限流，而不是按 run**：多版模式一次点击产出的 3 个 run 属于同一个 `batchId`。若按 run 限 5 条，两批就把名额吃光；按批次限 5 个，回看时也正好是「一批 3 个版本」的对比单元。淘汰时整批删除，不会出现同批只剩一半版本。
+9. **风格模板按 run 存快照，而不是只存模板 id**：模板可编辑可删除，历史任务却需要长期可解释。存 `{ id, name, prompt }` 后，模板后续怎么变都不影响已完成的 run，回看时能还原当时的完整入参。代价是快照体积增加约 1 KB/渠道，相对于正文可忽略。
+10. **内置模板只读，改内置走「复制」**：允许直接编辑内置模板会导致演示环境的默认文风被改坏且无法回到初始状态。只读 + 复制既保证默认可用，又保留了自定义空间；存储层同时兜底，即使手改 `data/styles.json` 把 `builtin` 改成 true 也会被强制改回 false。
 
 ## 模块职责
 
@@ -329,3 +383,7 @@ page.tsx (variant)
 | 图片存储 | public/generated/ | 出图产物本地持久化，前端以 `/generated/xxx.png` 引用（仅本地可用，Vercel 只读环境不可写） |
 | 历史快照 | lib/history.ts | 终态快照落盘、按批次聚合、保留最近 5 批并整批淘汰 |
 | 历史数据目录 | data/runs/ | 终态 run 的完整快照，已加入 `.gitignore` |
+| 风格模板定义 | lib/styles.ts | 渠道定义、6 套内置模板、入参校验、风格块拼装（纯数据，前后端共用） |
+| 风格模板存储 | lib/style-store.ts | 自定义模板读写 `data/styles.json`，内置只读保护，run 创建时解析快照 |
+| 风格模板接口 | app/api/styles/ | 模板列表、新建、编辑、删除；内置模板 403 |
+| 自定义模板目录 | data/styles.json | 用户保存的文风模板，已加入 `.gitignore` |
