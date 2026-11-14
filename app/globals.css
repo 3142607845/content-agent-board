@@ -46,3 +46,51 @@ body {
   font-family: var(--font-geist-sans), "PingFang SC", "Microsoft YaHei",
     system-ui, sans-serif;
 }
+
+/* 展开区块：轻微上浮淡入，避免折叠态到展开态瞬间跳变 */
+@keyframes panel-in {
+  from {
+    opacity: 0;
+    transform: translateY(-4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.panel-in {
+  animation: panel-in 180ms cubic-bezier(0.2, 0.7, 0.3, 1);
+}
+
+/* 首屏区块依次浮现 */
+@keyframes rise-in {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.reveal {
+  animation: rise-in 460ms cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+/* 流水线卡片：hover 时其余卡片退到背景，聚焦当前节点 */
+.node-grid:has(> section:hover) > section:not(:hover) {
+  opacity: 0.62;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .panel-in,
+  .reveal {
+    animation: none;
+  }
+
+  .node-grid:has(> section:hover) > section:not(:hover) {
+    opacity: 1;
+  }
+}

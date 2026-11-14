@@ -1,6 +1,13 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import {
+  Fragment,
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+  type CSSProperties,
+} from "react";
 import type {
   AgentNodeState,
   NodeId,
@@ -121,6 +128,46 @@ const MODE_TABS: { id: Mode; label: string }[] = [
   { id: "multi-topic", label: "批量选题模式" },
   { id: "multi-version", label: "多版生成模式" },
 ];
+
+/** 示例选题：降低"不知道输入什么"的启动成本 */
+const EXAMPLE_TOPICS = [
+  "午睡为什么越睡越困",
+  "AI 编程会不会取代程序员",
+  "远程办公三年，我为什么又回了办公室",
+];
+
+/** 首次进入的三步引导，目标元素由 ref 定位 */
+const TOUR_STEPS = [
+  {
+    title: "先给一个选题",
+    desc: "写一句话即可，也可以点下方的示例选题直接填入。",
+  },
+  {
+    title: "选一个运行模式",
+    desc: "单次生成一个版本，批量模式可以一次跑多个选题或三个创作维度。",
+  },
+  {
+    title: "启动流水线",
+    desc: "五个 Agent 会依次亮起，运行中可以随时中断单个节点。",
+  },
+];
+
+/** 分叉轨道配色：与卡片状态保持同一套语义 */
+const RAIL_LINE: Record<NodeStatus, string> = {
+  pending: "bg-hairline-strong",
+  running: "bg-blue-300",
+  completed: "bg-emerald-300",
+  failed: "bg-red-300",
+  cancelled: "bg-amber-300",
+};
+
+const RAIL_DOT: Record<NodeStatus, string> = {
+  pending: "bg-neutral-300",
+  running: "bg-blue-500",
+  completed: "bg-emerald-500",
+  failed: "bg-red-500",
+  cancelled: "bg-amber-500",
+};
 
 interface TaskResult {
   id: string;
@@ -343,6 +390,17 @@ export default function Home() {
   const [historyOpen, setHistoryOpen] = useState(false);
   const [reviewing, setReviewing] = useState<ReviewingState | null>(null);
 
+  // 首次进入的三步引导：localStorage 只记一次，也可从头部按钮重新唤起
+  const [tourStep, setTourStep] = useState(0);
+  const [tourLayout, setTourLayout] = useState<{
+    rect: { top: number; left: number; width: number; height: number };
+    vw: number;
+    vh: number;
+  } | null>(null);
+  const topicInputRef = useRef<HTMLInputElement | null>(null);
+  const modeTabsRef = useRef<HTMLDivElement | null>(null);
+  const startButtonRef = useRef<HTMLButtonElement | null>(null);
+
   const loadHistory = useCallback(async () => {
     try {
       const res = await fetch("/api/history", { cache: "no-store" });
@@ -358,6 +416,50 @@ export default function Home() {
   useEffect(() => {
     void loadHistory();
   }, [loadHistory]);
+
+  // 首次访问自动弹引导；已看过或存储不可用时安静跳过
+  useEffect(() => {
+    try {
+      if (window.localStorage.getItem("cab-guide-seen") !== "1") setTourStep(1);
+    } catch {
+      // 隐私模式读不到 localStorage，不打扰用户
+    }
+  }, []);
+
+  // 引导每一步都重新测量目标位置，窗口缩放或滚动时同步更新
+  useEffect(() => {
+    if (tourStep === 0) return;
+    const target =
+      tourStep === 1
+        ? topicInputRef.current
+        : tourStep === 2
+          ? modeTabsRef.current
+          : startButtonRef.current;
+    if (!target) {
+      setTourLayout(null);
+      return;
+    }
+    const measure = () => {
+      const rect = target.getBoundingClientRect();
+      setTourLayout({
+        rect: {
+          top: rect.top,
+          left: rect.left,
+          width: rect.width,
+          height: rect.height,
+        },
+        vw: window.innerWidth,
+        vh: window.innerHeight,
+      });
+    };
+    measure();
+    window.addEventListener("resize", measure);
+    window.addEventListener("scroll", measure, true);
+    return () => {
+      window.removeEventListener("resize", measure);
+      window.removeEventListener("scroll", measure, true);
+    };
+  }, [tourStep]);
 
   useEffect(
     () => () => {
@@ -894,6 +996,40 @@ export default function Home() {
     setNotice("");
   }
 
+  // 引导：结束并记住，下次不再自动弹出
+  function finishTour() {
+    setTourStep(0);
+    setTourLayout(null);
+    try {
+      window.localStorage.setItem("cab-guide-seen", "1");
+    } catch {
+      // 存储不可用时只在本次会话关闭
+    }
+  }
+
+  function nextTourStep() {
+    if (tourStep >= TOUR_STEPS.length) {
+      finishTour();
+      return;
+    }
+    setTourStep((step) => step + 1);
+  }
+
+  // 点示例选题：单次/多版直接填入，批量模式追加一行，最多 3 条
+  function applyExample(example: string) {
+    if (isRunning) return;
+    if (mode === "multi-topic") {
+      const lines = multiTopic
+        .split("\n")
+        .map((line) => line.trim())
+        .filter(Boolean);
+      if (lines.includes(example) || lines.length >= 3) return;
+      setMultiTopic([...lines, example].join("\n"));
+      return;
+    }
+    setTopic(example);
+  }
+
   function switchMode(next: Mode) {
     if (isRunning) return;
     // 回看态下切模式视为离开回看，避免历史内容与新模式的空态混在一起
@@ -949,6 +1085,27 @@ export default function Home() {
     );
   }
 
+  // 引导气泡：优先放在目标下方，空间不够则翻到上方
+  const tourCopy = tourStep > 0 ? TOUR_STEPS[tourStep - 1] : null;
+  const tourTooltipStyle: CSSProperties = tourLayout
+    ? {
+        top:
+          tourLayout.rect.top + tourLayout.rect.height + 16 + 170 < tourLayout.vh
+            ? tourLayout.rect.top + tourLayout.rect.height + 16
+            : Math.max(16, tourLayout.rect.top - 186),
+        left: Math.min(
+          Math.max(16, tourLayout.rect.left),
+          Math.max(16, tourLayout.vw - 316),
+        ),
+        width: 300,
+      }
+    : {
+        top: "50%",
+        left: "50%",
+        transform: "translate(-50%, -50%)",
+        width: 300,
+      };
+
   return (
     <>
       {/* 3D 氛围背景：最底层装饰，指针事件穿透，不参与任何交互 */}
@@ -976,6 +1133,12 @@ export default function Home() {
               {statusText}
             </span>
             <button
+              onClick={() => setTourStep(1)}
+              className={`${BTN_QUIET} px-3 py-1.5`}
+            >
+              使用引导
+            </button>
+            <button
               onClick={() => {
                 setHistoryOpen((prev) => !prev);
                 if (!historyOpen) void loadHistory();
@@ -991,7 +1154,7 @@ export default function Home() {
 
       <main className="mx-auto flex w-full max-w-6xl flex-1 flex-col gap-5 px-6 py-6">
       {/* 首屏说明区：产品定位 + 流水线示意图 */}
-      <section className="relative overflow-hidden rounded-2xl border border-hairline bg-surface shadow-card">
+      <section className="reveal relative overflow-hidden rounded-2xl border border-hairline bg-surface shadow-card">
         <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(36rem_20rem_at_100%_0%,#eef0ff_0%,transparent_70%)]" />
         <div className="relative flex flex-col gap-6 p-6 md:flex-row md:items-center md:p-7">
           <div className="flex-1">
@@ -1143,8 +1306,14 @@ export default function Home() {
         <span className="text-xs text-ink-3">选择模式、输入选题、启动流水线</span>
       </div>
 
-      <section className={`${CARD} overflow-hidden`}>
-        <div className="flex gap-1 border-b border-hairline bg-canvas/70 p-2">
+      <section
+        className={`${CARD} reveal overflow-hidden`}
+        style={{ animationDelay: "80ms" }}
+      >
+        <div
+          ref={modeTabsRef}
+          className="flex gap-1 border-b border-hairline bg-canvas/70 p-2"
+        >
           {MODE_TABS.map((tab) => (
             <button
               key={tab.id}
@@ -1165,6 +1334,7 @@ export default function Home() {
           {mode === "single" && (
             <div className="flex flex-col gap-2 sm:flex-row">
               <input
+                ref={topicInputRef}
                 value={topic}
                 onChange={(e) => setTopic(e.target.value)}
                 onKeyDown={(e) => {
@@ -1175,6 +1345,7 @@ export default function Home() {
               />
               <div className="flex flex-wrap gap-2">
                 <button
+                  ref={startButtonRef}
                   onClick={handleStartSingle}
                   disabled={isRunning || !topic.trim()}
                   className={BTN_PRIMARY}
@@ -1260,6 +1431,29 @@ export default function Home() {
               </div>
             </div>
           )}
+
+          {/* 示例选题：不知道写什么时一键填入 */}
+          <div className="flex flex-wrap items-center gap-2 border-t border-dashed border-hairline pt-3">
+            <span className="text-[11px] text-ink-3">试试这些选题</span>
+            {EXAMPLE_TOPICS.map((example) => {
+              const used =
+                mode === "multi-topic" ? multiTopic.includes(example) : topic === example;
+              return (
+                <button
+                  key={example}
+                  onClick={() => applyExample(example)}
+                  disabled={isRunning}
+                  className={`rounded-full border px-2.5 py-1 text-xs transition disabled:opacity-40 ${
+                    used
+                      ? "border-accent bg-accent text-white"
+                      : "border-hairline-strong bg-surface text-ink-2 hover:border-accent hover:text-accent"
+                  }`}
+                >
+                  {example}
+                </button>
+              );
+            })}
+          </div>
         </div>
 
         {/* 运行状态条：常驻在控制台底部 */}
@@ -1353,8 +1547,11 @@ export default function Home() {
         </button>
       </div>
 
-      {/* 卡片区 */}
-      <div className="grid grid-cols-1 gap-4 md:grid-cols-2 md:items-start xl:grid-cols-4">
+      {/* 卡片区：hover 时其余卡片退到背景，聚焦当前节点 */}
+      <div
+        className="node-grid reveal grid grid-cols-1 gap-4 md:grid-cols-2 md:items-start xl:grid-cols-4"
+        style={{ animationDelay: "160ms" }}
+      >
         {NODE_ORDER.map((nodeId) => {
           const node = currentNodes[nodeId];
           const style = STATUS_STYLE[node.status];
@@ -1370,15 +1567,17 @@ export default function Home() {
               node.status === "completed");
 
           return (
+            <Fragment key={nodeId}>
             <section
-              key={nodeId}
               className={`relative flex flex-col gap-3 overflow-hidden rounded-xl border border-hairline bg-surface p-4 shadow-card transition duration-200 hover:-translate-y-0.5 hover:shadow-pop ${
                 isPlanner ? "md:col-span-2 xl:col-span-4" : ""
-              }`}
+              } ${node.status === "running" ? "ring-1 ring-blue-200/70" : ""}`}
             >
-              {/* 状态用左色条表达，卡片底始终中性 */}
+              {/* 状态用左色条表达，卡片底始终中性；运行中轻微脉冲提示活动节点 */}
               <span
-                className={`absolute inset-y-0 left-0 w-[3px] ${style.bar}`}
+                className={`absolute inset-y-0 left-0 w-[3px] ${style.bar} ${
+                  node.status === "running" ? "animate-pulse" : ""
+                }`}
                 aria-hidden
               />
               <button
@@ -1469,7 +1668,7 @@ export default function Home() {
               )}
 
               {isExpanded && (
-                <>
+                <div className="panel-in flex flex-col gap-3">
                   <div className="flex flex-wrap gap-2">
                     <button
                       onClick={() => handleStopNode(nodeId)}
@@ -1532,9 +1731,49 @@ export default function Home() {
                   >
                     {node.content || "（暂无内容）"}
                   </pre>
-                </>
+                </div>
               )}
             </section>
+
+            {/* 分叉轨道：只在 xl 四列布局下出现，把策划节点与四路产出连成一张图 */}
+            {isPlanner && (
+              <div className="relative hidden h-8 xl:col-span-4 xl:block">
+                <span
+                  className={`absolute left-1/2 -top-4 h-8 w-px -translate-x-1/2 ${RAIL_LINE[node.status]}`}
+                  aria-hidden
+                />
+                <div className="grid h-full grid-cols-4 gap-4">
+                  {NODE_ORDER.slice(1).map((id, index) => {
+                    const target = currentNodes[id];
+                    return (
+                      <div key={id} className="relative">
+                        <span
+                          className={`absolute top-4 h-px ${
+                            index === 0
+                              ? "left-1/2 right-0"
+                              : index === NODE_ORDER.length - 2
+                                ? "left-0 right-1/2"
+                                : "left-0 right-0"
+                          } ${RAIL_LINE[target.status]}`}
+                          aria-hidden
+                        />
+                        <span
+                          className={`absolute left-1/2 top-4 h-8 w-px -translate-x-1/2 ${RAIL_LINE[target.status]}`}
+                          aria-hidden
+                        />
+                        <span
+                          className={`absolute left-1/2 top-4 h-2 w-2 -translate-x-1/2 -translate-y-1/2 rounded-full ring-2 ring-surface ${RAIL_DOT[target.status]} ${
+                            target.status === "running" ? "animate-pulse" : ""
+                          }`}
+                          aria-hidden
+                        />
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+            </Fragment>
           );
         })}
       </div>
@@ -1567,6 +1806,62 @@ export default function Home() {
           <BatchSummary tasks={tasks} />
         )}
       </main>
+
+      {/* 首次进入引导：半透明遮罩挖出目标区域，逐步说明三步 */}
+      {tourStep > 0 && (
+        <div
+          className="fixed inset-0 z-50"
+          role="dialog"
+          aria-modal="true"
+          aria-label="使用引导"
+          onClick={nextTourStep}
+        >
+          {tourLayout ? (
+            <div
+              className="pointer-events-none absolute rounded-xl ring-2 ring-white/90 transition-all duration-300"
+              style={{
+                top: tourLayout.rect.top - 6,
+                left: tourLayout.rect.left - 6,
+                width: tourLayout.rect.width + 12,
+                height: tourLayout.rect.height + 12,
+                boxShadow: "0 0 0 9999px rgba(17, 24, 39, 0.42)",
+              }}
+            />
+          ) : (
+            <div className="absolute inset-0 bg-ink/40" />
+          )}
+
+          <div
+            className="absolute rounded-xl border border-hairline bg-surface p-4 shadow-pop"
+            style={tourTooltipStyle}
+            onClick={(event) => event.stopPropagation()}
+          >
+            <p className="text-[11px] font-mono tabular-nums text-ink-3">
+              {tourStep} / {TOUR_STEPS.length}
+            </p>
+            <h3 className="mt-1 text-sm font-semibold text-ink">
+              {tourCopy?.title}
+            </h3>
+            <p className="mt-1 text-xs leading-relaxed text-ink-2">
+              {tourCopy?.desc}
+            </p>
+            <div className="mt-3 flex items-center justify-between">
+              <button
+                onClick={finishTour}
+                className="text-xs text-ink-3 transition hover:text-ink"
+              >
+                跳过
+              </button>
+              <button
+                onClick={nextTourStep}
+                className="rounded-md bg-accent px-3 py-1.5 text-xs font-medium text-white transition hover:bg-accent-strong"
+              >
+                {tourStep === TOUR_STEPS.length ? "开始使用" : "下一步"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </>
   );
 }
