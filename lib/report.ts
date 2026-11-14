@@ -14,6 +14,8 @@ export interface NodeReportItem {
   nodeId: string;
   name: string;
   model: string;
+  /** 该节点采用的文风模板名；策划与配图节点为 null */
+  styleName: string | null;
   status: string;
   /** 总尝试次数 */
   attempts: number;
@@ -78,6 +80,8 @@ export interface ReportNodeInput {
   name: string;
   /** 节点未启动时可能没有 model */
   model?: string;
+  /** 下游文本节点选用的文风模板 */
+  style?: { id: string; name: string };
   status: string;
   content: string;
   error?: string;
@@ -141,6 +145,7 @@ export function buildRunReport(input: ReportInput): RunReport {
       nodeId: node.id,
       name: node.name,
       model: node.model ?? "未启动",
+      styleName: node.style?.name ?? null,
       status: node.status,
       attempts: node.metrics ? node.metrics.retries + 1 : 0,
       retries: node.metrics?.retries ?? 0,

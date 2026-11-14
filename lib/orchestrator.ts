@@ -4,6 +4,7 @@ import { ScriptAgent } from "./agents/script";
 import { XhsAgent } from "./agents/xhs";
 import { ImageAgent } from "./agents/image";
 import type { VariantKey } from "./variants";
+import { buildStyleBlock, type StyleChannel, type StyleSnapshot } from "./styles";
 import type { TokenUsage } from "./llm";
 import { addUsage, buildRunReport, estimateTokens, type RunReport } from "./report";
 import { saveRunSnapshot } from "./history";
@@ -46,6 +47,8 @@ export interface AgentNodeState {
   attempt: number;
   /** 该节点使用的模型，未启动时为空 */
   model?: string;
+  /** 该节点采用的文风模板；只有下游三个文本节点会有值 */
+  style?: { id: string; name: string };
   /** 执行指标；节点未启动过则为空 */
   metrics?: NodeMetrics;
 }
@@ -82,6 +85,8 @@ export interface RunSnapshot {
   runId: string;
   topic: string;
   variant: VariantKey | null;
+  /** 本 run 选用的文风模板快照，按渠道存 */
+  styles: Partial<Record<StyleChannel, StyleSnapshot>>;
   status: RunStatus;
   createdAt: number;
   finishedAt: number | null;
@@ -107,6 +112,8 @@ export interface RunState {
   topic: string;
   /** 多版模式的创作维度；单次模式不传，策划按通用提纲生成 */
   variant: VariantKey | null;
+  /** 下游三个内容 Agent 各自选用的文风模板快照 */
+  styles: Partial<Record<StyleChannel, StyleSnapshot>>;
   /** 批次标识：多版模式一次点击产生的多个 run 共享同一批次，用于历史分组 */
   batchId: string;
   status: RunStatus;
@@ -183,12 +190,14 @@ export function createRun(
   topic: string,
   variant?: VariantKey,
   batchId?: string,
+  styles?: Partial<Record<StyleChannel, StyleSnapshot>>,
 ): RunState {
   const id = crypto.randomUUID();
   const run: RunState = {
     id,
     topic,
     variant: variant ?? null,
+    styles: styles ?? {},
     batchId: batchId ?? id,
     status: "running",
     nodes: initNodes(),
@@ -233,6 +242,7 @@ export function buildSnapshot(run: RunState): RunSnapshot {
     runId: run.id,
     topic: run.topic,
     variant: run.variant,
+    styles: run.styles,
     status: run.status,
     createdAt: run.createdAt,
     finishedAt: run.finishedAt,
@@ -468,18 +478,35 @@ function getSection(run: RunState, key: string): unknown {
   return parsed?.outline?.[key] ?? null;
 }
 
-function buildSectionInput(topic: string, section: unknown): string {
+function buildSectionInput(
+  topic: string,
+  section: unknown,
+  style?: StyleSnapshot,
+): string {
   const body = section
     ? JSON.stringify(section, null, 2)
     : "（策划未提供该渠道的提纲，请根据选题自行发挥）";
-  return `选题：${topic}\n\n专属提纲：\n${body}`;
+  const base = `选题：${topic}\n\n专属提纲：\n${body}`;
+  return style ? `${base}${buildStyleBlock(style)}` : base;
 }
 
 async function runParallel(run: RunState): Promise<void> {
   await Promise.allSettled([
-    runTextNode(run, "longform", new LongformAgent(), getSection(run, "longForm")),
-    runTextNode(run, "script", new ScriptAgent(), getSection(run, "script")),
-    runTextNode(run, "xhs", new XhsAgent(), getSection(run, "xhs")),
+    runTextNode(
+      run,
+      "longform",
+      new LongformAgent(),
+      getSection(run, "longForm"),
+      run.styles.longform,
+    ),
+    runTextNode(
+      run,
+      "script",
+      new ScriptAgent(),
+      getSection(run, "script"),
+      run.styles.script,
+    ),
+    runTextNode(run, "xhs", new XhsAgent(), getSection(run, "xhs"), run.styles.xhs),
     runImageNode(run, getSection(run, "image")),
   ]);
 
@@ -510,9 +537,10 @@ async function runTextNode(
   nodeId: NodeId,
   agent: TextCapableAgent,
   section: unknown,
+  style?: StyleSnapshot,
 ): Promise<void> {
   const node = run.nodes[nodeId];
-  const input = buildSectionInput(run.topic, section);
+  const input = buildSectionInput(run.topic, section, style);
 
   // 用户在调度前已经取消了这个节点（比如策划阶段就中断了 xhs），不再启动
   if (node.status === "cancelled") return;
@@ -523,6 +551,9 @@ async function runTextNode(
     emit(run, { type: "node:cancelled", nodeId });
     return;
   }
+
+  // 文风快照只用于界面展示与历史回看，真正约束模型的内容在 input 里
+  node.style = style ? { id: style.id, name: style.name } : undefined;
 
   const metrics: NodeMetrics = { startedAt: Date.now(), retries: 0 };
   node.metrics = metrics;
@@ -759,11 +790,29 @@ export function rerunNode(runId: string, nodeId: NodeId): boolean {
   if (nodeId === "image") {
     void runImageNode(run, getSection(run, "image"));
   } else if (nodeId === "longform") {
-    void runTextNode(run, "longform", new LongformAgent(), getSection(run, "longForm"));
+    void runTextNode(
+      run,
+      "longform",
+      new LongformAgent(),
+      getSection(run, "longForm"),
+      run.styles.longform,
+    );
   } else if (nodeId === "script") {
-    void runTextNode(run, "script", new ScriptAgent(), getSection(run, "script"));
+    void runTextNode(
+      run,
+      "script",
+      new ScriptAgent(),
+      getSection(run, "script"),
+      run.styles.script,
+    );
   } else {
-    void runTextNode(run, "xhs", new XhsAgent(), getSection(run, "xhs"));
+    void runTextNode(
+      run,
+      "xhs",
+      new XhsAgent(),
+      getSection(run, "xhs"),
+      run.styles.xhs,
+    );
   }
 
   return true;
