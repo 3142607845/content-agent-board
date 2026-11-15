@@ -8,6 +8,7 @@ import { buildStyleBlock, type StyleChannel, type StyleSnapshot } from "./styles
 import type { TokenUsage } from "./llm";
 import { addUsage, buildRunReport, estimateTokens, type RunReport } from "./report";
 import { saveRunSnapshot } from "./history";
+import { diffOutlineChannels, outlineSection } from "./outline-diff";
 
 /**
  * 编排引擎
@@ -83,6 +84,8 @@ export interface OutlineVersion {
   source: "planner" | "manual";
   createdAt: number;
   outline: unknown;
+  /** 该版本提交时实际重跑的渠道，用于前端区分多次「手动编辑」；策划原始版本没有 */
+  affected?: NodeId[];
 }
 
 /**
@@ -546,22 +549,9 @@ async function runPlanner(run: RunState): Promise<boolean> {
   return false;
 }
 
-/** 提纲渠道字段与下游节点的对应关系，局部重生成按这个粒度做 diff */
-const OUTLINE_CHANNELS: { key: string; nodeId: NodeId }[] = [
-  { key: "longForm", nodeId: "longform" },
-  { key: "script", nodeId: "script" },
-  { key: "xhs", nodeId: "xhs" },
-  { key: "image", nodeId: "image" },
-];
-
 /** 从策划提纲里取某个渠道的片段，取不到就返回 null，交给 Agent 自行发挥 */
 function getSection(run: RunState, key: string): unknown {
   return outlineSection(run.outline, key);
-}
-
-function outlineSection(outline: unknown, key: string): unknown {
-  const parsed = outline as { outline?: Record<string, unknown> } | null;
-  return parsed?.outline?.[key] ?? null;
 }
 
 function buildSectionInput(
@@ -985,14 +975,17 @@ export function regenerateFromOutline(
     };
   }
 
-  const affected = OUTLINE_CHANNELS.filter(
-    ({ key }) =>
-      JSON.stringify(outlineSection(run.outline, key)) !==
-      JSON.stringify(outlineSection(outline, key)),
-  ).map(({ nodeId }) => nodeId);
+  const affected = diffOutlineChannels(run.outline, outline);
 
   if (affected.length === 0) {
-    return { ok: false, code: "invalid", error: "提纲没有变化，无需重生成下游" };
+    return {
+      ok: false,
+      code: "invalid",
+      error:
+        JSON.stringify(run.outline) === serialized
+          ? "提纲没有变化，无需重生成下游"
+          : "只改了选题：选题变化不影响四个渠道，请修改至少一个渠道的内容",
+    };
   }
 
   let version = run.outlineVersions.find(
@@ -1005,6 +998,7 @@ export function regenerateFromOutline(
       source: "manual",
       createdAt: Date.now(),
       outline,
+      affected,
     };
     run.outlineVersions.push(version);
   }
