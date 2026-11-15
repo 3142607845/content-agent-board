@@ -29,6 +29,18 @@ import {
 } from "@/lib/styles";
 import type { HistoryBatch, HistoryRunEntry } from "@/lib/history";
 import { diffOutlineChannels } from "@/lib/outline-diff";
+import {
+  isSavableNodeId,
+  LIBRARY_MAX_ITEMS,
+  LIBRARY_NODE_NAMES,
+  type SavedItem,
+} from "@/lib/library-model";
+import {
+  PROJECT_CHANNEL_IDS,
+  PROJECT_CHANNEL_NAMES,
+  PROJECT_MAX_ITEMS,
+  type ProjectItem,
+} from "@/lib/project-model";
 import BackgroundScene from "./background-scene";
 
 const NODE_ORDER: NodeId[] = ["planner", "longform", "script", "xhs", "image"];
@@ -448,6 +460,16 @@ export default function Home() {
   const [historyOpen, setHistoryOpen] = useState(false);
   const [reviewing, setReviewing] = useState<ReviewingState | null>(null);
 
+  // 成品库：与历史批次解耦，用户主动保存的产出不被 5 批上限淘汰
+  const [libraryItems, setLibraryItems] = useState<SavedItem[]>([]);
+  const [libraryOpen, setLibraryOpen] = useState(false);
+  /** 正在保存的节点 id，用于按钮 loading 态 */
+  const [libraryBusy, setLibraryBusy] = useState<NodeId | "">("");
+  // 项目库：整批收藏，与单张卡片成品库独立
+  const [projectItems, setProjectItems] = useState<ProjectItem[]>([]);
+  const [libraryTab, setLibraryTab] = useState<"card" | "project">("card");
+  const [projectBusy, setProjectBusy] = useState(false);
+
   // 风格模板：内置 + 自定义全量列表，按渠道过滤使用
   const [styleTemplates, setStyleTemplates] = useState<StyleTemplate[]>([]);
   const [styleSelection, setStyleSelection] = useState<
@@ -504,10 +526,34 @@ export default function Home() {
     }
   }, []);
 
-  // 首次进入拉一次：刷新页面后历史入口仍然有内容
+  const loadLibrary = useCallback(async () => {
+    try {
+      const res = await fetch("/api/library", { cache: "no-store" });
+      if (!res.ok) return;
+      const data = (await res.json()) as { items?: SavedItem[] };
+      setLibraryItems(data.items ?? []);
+    } catch {
+      // 成品库取不到不影响流水线
+    }
+  }, []);
+
+  const loadProjects = useCallback(async () => {
+    try {
+      const res = await fetch("/api/projects", { cache: "no-store" });
+      if (!res.ok) return;
+      const data = (await res.json()) as { items?: ProjectItem[] };
+      setProjectItems(data.items ?? []);
+    } catch {
+      // 项目库取不到不影响流水线
+    }
+  }, []);
+
+  // 首次进入拉一次：历史入口与成品库/项目库数量在刷新后仍然有内容
   useEffect(() => {
     void loadHistory();
-  }, [loadHistory]);
+    void loadLibrary();
+    void loadProjects();
+  }, [loadHistory, loadLibrary, loadProjects]);
 
   const loadStyles = useCallback(async () => {
     try {
@@ -630,6 +676,10 @@ export default function Home() {
     mode === "single" ? report : tasks[activeTaskIndex]?.report ?? null;
   const isRunning = currentTaskStatus === "running";
   const isCompleted = currentTaskStatus === "completed";
+  // 收藏整个项目要求四路内容都已完成并产出实际内容
+  const allFourCompleted = PROJECT_CHANNEL_IDS.every(
+    (id) => currentNodes[id]?.status === "completed",
+  );
 
   // 当前 run 的提纲版本链与编辑草稿状态
   const currentOutline = currentRunId ? outlines[currentRunId] ?? null : null;
@@ -1279,6 +1329,144 @@ export default function Home() {
     URL.revokeObjectURL(url);
   }
 
+  // —— 成品库：把内容卡片存成不被历史淘汰的长期产出 ——
+  async function handleSaveToLibrary(nodeId: NodeId) {
+    const runId = currentRunId;
+    if (!runId || !isSavableNodeId(nodeId) || libraryBusy) return;
+
+    setLibraryBusy(nodeId);
+    try {
+      const res = await fetch("/api/library", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ runId, nodeId }),
+      });
+      const data = (await res.json().catch(() => ({}))) as {
+        updated?: boolean;
+        error?: string;
+      };
+      if (!res.ok) throw new Error(data.error ?? `入库失败 ${res.status}`);
+      await loadLibrary();
+      setNotice(
+        data.updated
+          ? `已更新成品库里的「${NODE_META[nodeId].name}」`
+          : `已收藏到成品库：${NODE_META[nodeId].name}`,
+      );
+    } catch (err) {
+      setNotice(err instanceof Error ? err.message : String(err));
+    } finally {
+      setLibraryBusy("");
+    }
+  }
+
+  async function handleRemoveLibraryItem(item: SavedItem) {
+    try {
+      const res = await fetch(`/api/library/${encodeURIComponent(item.id)}`, {
+        method: "DELETE",
+      });
+      const data = (await res.json().catch(() => ({}))) as { error?: string };
+      if (!res.ok) throw new Error(data.error ?? `删除失败 ${res.status}`);
+      setLibraryItems((prev) => prev.filter((entry) => entry.id !== item.id));
+      setNotice("已从成品库移除");
+    } catch (err) {
+      setNotice(err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  async function handleCopyLibraryItem(item: SavedItem) {
+    if (!item.content.trim()) {
+      setNotice("该成品没有可复制的文本");
+      return;
+    }
+    try {
+      await navigator.clipboard.writeText(item.content);
+      setNotice(`已复制「${LIBRARY_NODE_NAMES[item.nodeId]}」`);
+    } catch {
+      setNotice("复制失败，请手动选择文本复制");
+    }
+  }
+
+  function handleDownloadLibraryItem(item: SavedItem) {
+    const a = document.createElement("a");
+    if (item.nodeId === "image" && item.imageUrl) {
+      a.href = item.imageUrl;
+      a.download = `${item.topic || "image"}.png`;
+    } else {
+      const md = `# ${item.topic}\n\n## ${LIBRARY_NODE_NAMES[item.nodeId]}\n\n${item.content}\n`;
+      a.href = URL.createObjectURL(
+        new Blob([md], { type: "text/markdown;charset=utf-8" }),
+      );
+      a.download = `${item.topic || "content"}-${item.nodeId}.md`;
+    }
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(a.href);
+  }
+
+  // —— 项目库：把一整条流水线的全部产出收藏成一个整体 ——
+  async function handleSaveProject() {
+    const runId = currentRunId;
+    if (!runId || projectBusy) return;
+    setProjectBusy(true);
+    try {
+      const res = await fetch("/api/projects", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ runId }),
+      });
+      const data = (await res.json().catch(() => ({}))) as {
+        updated?: boolean;
+        error?: string;
+      };
+      if (!res.ok) throw new Error(data.error ?? `收藏失败 ${res.status}`);
+      await loadProjects();
+      setNotice(
+        data.updated ? "已更新项目库里的这批产出" : "已收藏整个项目到项目库",
+      );
+      // 收藏完直接切到项目标签，让用户立刻看到结果
+      setLibraryTab("project");
+      setLibraryOpen(true);
+    } catch (err) {
+      setNotice(err instanceof Error ? err.message : String(err));
+    } finally {
+      setProjectBusy(false);
+    }
+  }
+
+  async function handleRemoveProject(item: ProjectItem) {
+    try {
+      const res = await fetch(`/api/projects/${encodeURIComponent(item.id)}`, {
+        method: "DELETE",
+      });
+      const data = (await res.json().catch(() => ({}))) as { error?: string };
+      if (!res.ok) throw new Error(data.error ?? `删除失败 ${res.status}`);
+      setProjectItems((prev) => prev.filter((entry) => entry.id !== item.id));
+      setNotice("已从项目库移除");
+    } catch (err) {
+      setNotice(err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  function handleDownloadProject(item: ProjectItem) {
+    const { longform, script, xhs, image } = item.channels;
+    const md =
+      `# 选题：${item.topic}\n\n` +
+      `## 公众号长文\n\n${longform.content}\n\n` +
+      `## 短视频脚本\n\n${script.content}\n\n` +
+      `## 小红书笔记\n\n${xhs.content}\n\n` +
+      `## 配图\n\n![配图](${image.imageUrl || ""})\n`;
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(
+      new Blob([md], { type: "text/markdown;charset=utf-8" }),
+    );
+    a.download = `${item.topic || "project"}-项目.md`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(a.href);
+  }
+
   // 打开一条历史任务：用落盘快照回填结果区，进入只读回看，不建立 SSE
   async function openHistoryRun(entry: HistoryRunEntry) {
     esRef.current?.close();
@@ -1787,6 +1975,18 @@ export default function Home() {
               历史记录
               {historyBatches.length > 0 ? ` (${historyBatches.length})` : ""}
             </button>
+            <button
+              onClick={() => {
+                setLibraryOpen((prev) => !prev);
+                if (!libraryOpen) void loadLibrary();
+              }}
+              className={`${BTN_QUIET} px-3 py-1.5`}
+            >
+              成品库
+              {libraryItems.length + projectItems.length > 0
+                ? ` (${libraryItems.length + projectItems.length})`
+                : ""}
+            </button>
           </div>
         </div>
       </header>
@@ -1918,6 +2118,194 @@ export default function Home() {
                         </button>
                       </div>
                     ))}
+                  </div>
+                </li>
+              ))}
+            </ul>
+          )}
+        </section>
+      )}
+
+      {/* 成品库：卡片成品库与整批项目库共用一个面板，用标签切换 */}
+      {libraryOpen && (
+        <section className={`${CARD} flex flex-col gap-3 p-4`}>
+          <div className="flex items-start justify-between gap-2">
+            <div>
+              <h2 className="text-sm font-semibold text-ink">
+                成品库
+                <span className="ml-2 text-[11px] font-normal tabular-nums text-ink-3">
+                  共 {libraryItems.length + projectItems.length} 项
+                </span>
+              </h2>
+              <p className="text-xs text-ink-3">
+                卡片：单路产出；项目：一整条流水线的四路产出。都不随历史批次淘汰。
+              </p>
+            </div>
+            <div className="flex shrink-0 items-center gap-3">
+              <button
+                onClick={() => {
+                  void loadLibrary();
+                  void loadProjects();
+                }}
+                className="text-xs text-ink-3 transition hover:text-ink"
+              >
+                刷新
+              </button>
+              <button
+                onClick={() => setLibraryOpen(false)}
+                className="rounded-md border border-hairline-strong px-2 py-0.5 text-xs text-ink-2 transition hover:border-ink-3 hover:text-ink"
+              >
+                收起
+              </button>
+            </div>
+          </div>
+
+          {/* 标签切换：卡片 / 项目 */}
+          <div className="flex items-center gap-1">
+            <button
+              onClick={() => setLibraryTab("card")}
+              className={`rounded-md px-3 py-1 text-xs transition ${
+                libraryTab === "card"
+                  ? "bg-accent text-white"
+                  : "text-ink-2 hover:text-ink"
+              }`}
+            >
+              卡片 ({libraryItems.length}/{LIBRARY_MAX_ITEMS})
+            </button>
+            <button
+              onClick={() => setLibraryTab("project")}
+              className={`rounded-md px-3 py-1 text-xs transition ${
+                libraryTab === "project"
+                  ? "bg-accent text-white"
+                  : "text-ink-2 hover:text-ink"
+              }`}
+            >
+              项目 ({projectItems.length}/{PROJECT_MAX_ITEMS})
+            </button>
+          </div>
+
+          {libraryTab === "card" ? (
+            libraryItems.length === 0 ? (
+              <p className="text-xs text-ink-3">
+                还没有收藏的卡片。任务跑完后，点内容卡右上角的「收藏」即可入库。
+              </p>
+            ) : (
+              <ul className="flex flex-col gap-2">
+                {libraryItems.map((item) => (
+                  <li
+                    key={item.id}
+                    className="flex flex-col gap-1.5 rounded-lg border border-hairline px-3 py-2"
+                  >
+                    <div className="flex flex-wrap items-center gap-2 text-xs">
+                      <span className="rounded bg-canvas px-1.5 py-0.5 text-[11px] text-ink-2">
+                        {LIBRARY_NODE_NAMES[item.nodeId]}
+                      </span>
+                      <span
+                        className="max-w-[18rem] truncate font-medium text-ink"
+                        title={item.topic}
+                      >
+                        {item.topic}
+                      </span>
+                      <span className="tabular-nums text-ink-3">
+                        {formatTime(item.savedAt)}
+                      </span>
+                      {item.styleName && (
+                        <span className="text-[11px] text-ink-3">
+                          风格 · {item.styleName}
+                        </span>
+                      )}
+                      <span className="ml-auto flex items-center gap-1">
+                        <button
+                          onClick={() => void handleCopyLibraryItem(item)}
+                          className="rounded-md border border-hairline-strong px-2 py-0.5 text-[11px] text-ink-2 transition hover:border-accent hover:text-accent"
+                        >
+                          复制
+                        </button>
+                        <button
+                          onClick={() => handleDownloadLibraryItem(item)}
+                          className="rounded-md border border-hairline-strong px-2 py-0.5 text-[11px] text-ink-2 transition hover:border-accent hover:text-accent"
+                        >
+                          下载
+                        </button>
+                        <button
+                          onClick={() => void handleRemoveLibraryItem(item)}
+                          className="rounded-md border border-hairline-strong px-2 py-0.5 text-[11px] text-ink-3 transition hover:border-red-300 hover:text-red-600"
+                        >
+                          移除
+                        </button>
+                      </span>
+                    </div>
+                    <p className="line-clamp-2 text-[11px] leading-relaxed text-ink-3">
+                      {item.nodeId === "image"
+                        ? `提示词：${item.content}`
+                        : item.content}
+                    </p>
+                  </li>
+                ))}
+              </ul>
+            )
+          ) : projectItems.length === 0 ? (
+            <p className="text-xs text-ink-3">
+              还没有收藏的项目。四路全部完成后，点「执行监视」右侧的「收藏整个项目」。
+            </p>
+          ) : (
+            <ul className="flex flex-col gap-2">
+              {projectItems.map((item) => (
+                <li
+                  key={item.id}
+                  className="flex flex-col gap-2 rounded-lg border border-hairline px-3 py-2"
+                >
+                  <div className="flex flex-wrap items-center gap-2 text-xs">
+                    <span className="rounded bg-canvas px-1.5 py-0.5 text-[11px] text-ink-2">
+                      项目
+                    </span>
+                    <span
+                      className="max-w-[18rem] truncate font-medium text-ink"
+                      title={item.topic}
+                    >
+                      {item.topic}
+                    </span>
+                    <span className="tabular-nums text-ink-3">
+                      {formatTime(item.savedAt)}
+                    </span>
+                    <span className="ml-auto flex items-center gap-1">
+                      <button
+                        onClick={() => handleDownloadProject(item)}
+                        className="rounded-md border border-hairline-strong px-2 py-0.5 text-[11px] text-ink-2 transition hover:border-accent hover:text-accent"
+                      >
+                        下载全套
+                      </button>
+                      <button
+                        onClick={() => void handleRemoveProject(item)}
+                        className="rounded-md border border-hairline-strong px-2 py-0.5 text-[11px] text-ink-3 transition hover:border-red-300 hover:text-red-600"
+                      >
+                        移除
+                      </button>
+                    </span>
+                  </div>
+                  {/* 四路产出的两行预览，便于快速确认收藏的是哪一版 */}
+                  <div className="grid gap-1 sm:grid-cols-2">
+                    {PROJECT_CHANNEL_IDS.map((id) => {
+                      const ch = item.channels[id];
+                      return (
+                        <div
+                          key={id}
+                          className="flex flex-col gap-0.5 rounded-md bg-canvas/60 px-2 py-1.5"
+                        >
+                          <span className="text-[11px] font-medium text-ink-2">
+                            {PROJECT_CHANNEL_NAMES[id]}
+                            {ch.styleName ? ` · ${ch.styleName}` : ""}
+                          </span>
+                          <p className="line-clamp-1 text-[11px] text-ink-3">
+                            {id === "image"
+                              ? ch.content
+                                ? `提示词：${ch.content}`
+                                : "（仅配图）"
+                              : ch.content || "（无正文）"}
+                          </p>
+                        </div>
+                      );
+                    })}
                   </div>
                 </li>
               ))}
@@ -2469,9 +2857,19 @@ export default function Home() {
           <h2 className="text-sm font-semibold text-ink">执行监视</h2>
           <span className="text-xs text-ink-3">5 个 Agent 节点</span>
         </div>
-        <button onClick={toggleAll} className={BTN_QUIET}>
-          {allExpanded ? "全部收起" : "全部展开"}
-        </button>
+        <div className="flex items-center gap-2">
+          <button
+            onClick={() => void handleSaveProject()}
+            disabled={!allFourCompleted || projectBusy}
+            title={allFourCompleted ? "把本批四路产出一起收藏" : "四路全部完成后才可收藏"}
+            className={BTN_QUIET}
+          >
+            {projectBusy ? "收藏中…" : "收藏整个项目"}
+          </button>
+          <button onClick={toggleAll} className={BTN_QUIET}>
+            {allExpanded ? "全部收起" : "全部展开"}
+          </button>
+        </div>
       </div>
 
       {/* 卡片区：hover 时其余卡片退到背景，聚焦当前节点 */}
@@ -2492,6 +2890,11 @@ export default function Home() {
             (node.status === "failed" ||
               node.status === "cancelled" ||
               node.status === "completed");
+          // 只有真正产出了内容（或配图）的卡片才可收藏，空结果不入库
+          const canCollect =
+            !isPlanner &&
+            node.status === "completed" &&
+            (nodeId === "image" ? !!node.imageUrl : !!node.content.trim());
 
           return (
             <Fragment key={nodeId}>
@@ -2507,36 +2910,51 @@ export default function Home() {
                 }`}
                 aria-hidden
               />
-              <button
-                type="button"
-                onClick={() => toggleNode(nodeId)}
-                className="flex w-full items-start justify-between gap-2 text-left"
-              >
-                <span className="flex items-center gap-2.5">
-                  <span
-                    className={`grid h-8 w-8 shrink-0 place-items-center rounded-lg text-[13px] font-semibold ring-1 ${NODE_META[nodeId].tint}`}
-                  >
-                    {NODE_META[nodeId].glyph}
-                  </span>
-                  <span className="text-sm font-semibold text-ink">
-                    {NODE_META[nodeId].name}
-                  </span>
-                  {isPlanner && (
-                    <span className="rounded border border-hairline bg-canvas px-1.5 py-0.5 text-[10px] text-ink-3">
-                      结构化提纲
+              {/* 卡片较窄时收藏按钮换行而不是挤掉状态标签 */}
+              <div className="flex flex-wrap items-start gap-2">
+                <button
+                  type="button"
+                  onClick={() => toggleNode(nodeId)}
+                  className="flex min-w-0 flex-1 items-start justify-between gap-2 text-left"
+                >
+                  <span className="flex items-center gap-2.5">
+                    <span
+                      className={`grid h-8 w-8 shrink-0 place-items-center rounded-lg text-[13px] font-semibold ring-1 ${NODE_META[nodeId].tint}`}
+                    >
+                      {NODE_META[nodeId].glyph}
                     </span>
-                  )}
-                </span>
-                <span className="flex items-center gap-2">
-                  <span className={`rounded-full px-2 py-0.5 text-xs ${style.badge}`}>
-                    {style.label}
-                    {node.attempt > 1 ? ` · 第${node.attempt}次` : ""}
+                    <span className="text-sm font-semibold text-ink">
+                      {NODE_META[nodeId].name}
+                    </span>
+                    {isPlanner && (
+                      <span className="rounded border border-hairline bg-canvas px-1.5 py-0.5 text-[10px] text-ink-3">
+                        结构化提纲
+                      </span>
+                    )}
                   </span>
-                  <span className="text-xs text-ink-3">
-                    {isExpanded ? "收起" : "展开"}
+                  <span className="flex shrink-0 items-center gap-2">
+                    <span className={`rounded-full px-2 py-0.5 text-xs ${style.badge}`}>
+                      {style.label}
+                      {node.attempt > 1 ? ` · 第${node.attempt}次` : ""}
+                    </span>
+                    <span className="text-xs text-ink-3">
+                      {isExpanded ? "收起" : "展开"}
+                    </span>
                   </span>
-                </span>
-              </button>
+                </button>
+                {/* 收藏入口固定在卡片头部，不随展开状态或滚动位置消失 */}
+                {canCollect && (
+                  <button
+                    type="button"
+                    onClick={() => void handleSaveToLibrary(nodeId)}
+                    disabled={libraryBusy === nodeId}
+                    title="收藏到成品库"
+                    className="shrink-0 rounded-md border border-hairline-strong px-2 py-1 text-[11px] text-ink-2 transition hover:border-accent hover:text-accent disabled:opacity-50"
+                  >
+                    {libraryBusy === nodeId ? "收藏中…" : "收藏"}
+                  </button>
+                )}
+              </div>
 
               <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
                 <p className="text-xs text-ink-3">{NODE_META[nodeId].desc}</p>
@@ -2651,6 +3069,15 @@ export default function Home() {
                         }`}
                       >
                         {copied[nodeId] ? "已复制" : "复制"}
+                      </button>
+                    )}
+                    {canCollect && (
+                      <button
+                        onClick={() => void handleSaveToLibrary(nodeId)}
+                        disabled={libraryBusy === nodeId}
+                        className={BTN_QUIET}
+                      >
+                        {libraryBusy === nodeId ? "收藏中…" : "收藏到成品库"}
                       </button>
                     )}
                   </div>
