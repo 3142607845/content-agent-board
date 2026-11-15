@@ -238,6 +238,47 @@ export function getRun(runId: string): RunState | undefined {
 }
 
 /**
+ * 把落盘快照重新装回内存，供「历史批次继续迭代」和刷新后恢复使用。
+ *
+ * 只回灌状态，不启动任何节点：恢复出来的 run 停留在快照里的终态，
+ * 用户编辑提纲后走 regenerateFromOutline 才会真正重跑受影响的渠道。
+ * 已在内存里的 run 直接复用，保证重复调用是幂等的。
+ */
+export function resumeRun(
+  snapshot: RunSnapshot & { batchId?: string },
+): RunState {
+  const existing = runs.get(snapshot.runId);
+  if (existing) return existing;
+
+  const versions = snapshot.outlineVersions ?? [];
+  const activeVersion =
+    versions.find((item) => item.id === snapshot.outlineVersionId) ??
+    versions[versions.length - 1];
+
+  const run: RunState = {
+    id: snapshot.runId,
+    topic: snapshot.topic,
+    variant: snapshot.variant,
+    styles: snapshot.styles ?? {},
+    batchId: snapshot.batchId ?? snapshot.runId,
+    status: snapshot.status,
+    // 快照里的节点与内存中的运行态不能共用引用，否则后续重跑会改到历史对象
+    nodes: structuredClone(snapshot.nodes),
+    outline: activeVersion?.outline ?? null,
+    outlineVersions: structuredClone(versions),
+    activeOutlineVersionId: activeVersion?.id ?? null,
+    subscribers: new Set(),
+    controllers: new Map(),
+    createdAt: snapshot.createdAt,
+    finishedAt: snapshot.finishedAt,
+    summary: snapshot.summary,
+    report: snapshot.report,
+  };
+  runs.set(run.id, run);
+  return run;
+}
+
+/**
  * 订阅事件。订阅瞬间先推一个全量 snapshot，
  * 之后只推增量事件。这样前端断线重连不需要回放成千上万个 token 事件。
  */
