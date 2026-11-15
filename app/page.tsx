@@ -28,6 +28,7 @@ import {
   type StyleTemplate,
 } from "@/lib/styles";
 import type { HistoryBatch, HistoryRunEntry } from "@/lib/history";
+import { diffOutlineChannels } from "@/lib/outline-diff";
 import BackgroundScene from "./background-scene";
 
 const NODE_ORDER: NodeId[] = ["planner", "longform", "script", "xhs", "image"];
@@ -66,6 +67,15 @@ const NODE_META: Record<
     glyph: "图",
     tint: "bg-amber-50 text-amber-600 ring-amber-100",
   },
+};
+
+/** 版本 chip 上的渠道短名，避免 chip 过长把整行撑开 */
+const CHANNEL_SHORT: Record<NodeId, string> = {
+  planner: "策划",
+  longform: "长文",
+  script: "脚本",
+  xhs: "小红书",
+  image: "配图",
 };
 
 /** 首页插图：AI 生成的内容流水线示意图，加载失败时退回纯色块不影响布局 */
@@ -631,6 +641,14 @@ export default function Home() {
     draftParse?.ok === true &&
     JSON.stringify(draftParse.value) !==
       JSON.stringify(activeOutlineVersion?.outline ?? null);
+  /** 提交前预览：这次改动会重跑哪几路，与服务端调度用同一套 diff */
+  const draftAffected =
+    draftParse?.ok === true
+      ? diffOutlineChannels(
+          activeOutlineVersion?.outline ?? null,
+          draftParse.value,
+        )
+      : [];
 
   const patchNodeSingle = useCallback(
     (nodeId: NodeId, patch: Partial<AgentNodeState>) => {
@@ -2676,7 +2694,13 @@ export default function Home() {
                                 key={version.id}
                                 onClick={() => beginOutlineEdit(version)}
                                 disabled={!!reviewing || outlineBusy}
-                                title={`${version.label} · ${formatTime(version.createdAt)}`}
+                                title={`${version.label}${
+                                  version.affected?.length
+                                    ? ` · 改动：${version.affected
+                                        .map((id) => NODE_META[id].name)
+                                        .join("、")}`
+                                    : ""
+                                } · ${formatTime(version.createdAt)}`}
                                 className={`rounded-md border px-2 py-0.5 text-[11px] transition disabled:opacity-50 ${
                                   isSelected
                                     ? "border-accent bg-accent text-white"
@@ -2686,6 +2710,13 @@ export default function Home() {
                                 }`}
                               >
                                 {version.id} · {version.label}
+                                {version.affected && version.affected.length > 0 && (
+                                  <span className="ml-1 opacity-70">
+                                    {version.affected
+                                      .map((id) => CHANNEL_SHORT[id])
+                                      .join("/")}
+                                  </span>
+                                )}
                                 {isActive ? " · 当前" : ""}
                               </button>
                             );
@@ -2721,7 +2752,7 @@ export default function Home() {
                                 outlineBusy ||
                                 isRunning ||
                                 !draftParse?.ok ||
-                                !outlineChanged
+                                draftAffected.length === 0
                               }
                               className="rounded-md bg-accent px-3 py-1.5 text-xs font-medium text-white transition hover:bg-accent-strong disabled:opacity-40"
                             >
@@ -2732,6 +2763,21 @@ export default function Home() {
                             {draftParse?.ok && !outlineChanged && (
                               <span className="text-[11px] text-ink-3">
                                 与当前版本一致，修改后才能提交
+                              </span>
+                            )}
+                            {draftParse?.ok &&
+                              outlineChanged &&
+                              draftAffected.length === 0 && (
+                                <span className="text-[11px] text-amber-600">
+                                  只改了选题：选题变化不影响四个渠道，请修改至少一个渠道后再提交
+                                </span>
+                              )}
+                            {draftAffected.length > 0 && (
+                              <span className="text-[11px] text-accent">
+                                将重跑：
+                                {draftAffected
+                                  .map((id) => NODE_META[id].name)
+                                  .join("、")}
                               </span>
                             )}
                           </div>
