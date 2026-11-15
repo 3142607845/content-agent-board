@@ -157,6 +157,11 @@ const MODE_TABS: { id: Mode; label: string }[] = [
   { id: "multi-version", label: "多版生成模式" },
 ];
 
+/** 本地会话：只记 runId 与展示信息，快照本身仍从服务端读 */
+const SESSION_KEY = "cab-last-run";
+/** 超过一天的上次任务不再提示，避免开屏被旧数据打扰 */
+const SESSION_TTL = 24 * 60 * 60 * 1000;
+
 /** 示例选题：降低"不知道输入什么"的启动成本 */
 const EXAMPLE_TOPICS = [
   "午睡为什么越睡越困",
@@ -456,6 +461,17 @@ export default function Home() {
   const [outlineNotice, setOutlineNotice] = useState("");
   const [outlineBusy, setOutlineBusy] = useState(false);
 
+  /** 刷新后接回的上次任务：只存快照，点「继续查看」才载入，不抢屏 */
+  const [pendingSession, setPendingSession] = useState<{
+    mode: Mode;
+    items: {
+      topic: string;
+      label: string;
+      variant?: VariantKey;
+      snap: RunSnapshot;
+    }[];
+  } | null>(null);
+
   // 首次进入的三步引导：localStorage 只记一次，也可从头部按钮重新唤起
   const [tourStep, setTourStep] = useState(0);
   const [tourLayout, setTourLayout] = useState<{
@@ -507,6 +523,33 @@ export default function Home() {
       // 模板列表取不到不影响主流程
     }
   }, []);
+
+  /** 记录「最近一次运行」到本地，刷新或重开页面时用来接回 */
+  const saveSession = useCallback(
+    (
+      sessionMode: Mode,
+      entries: {
+        runId: string;
+        topic: string;
+        label: string;
+        variant?: VariantKey;
+      }[],
+    ) => {
+      try {
+        window.localStorage.setItem(
+          SESSION_KEY,
+          JSON.stringify({
+            savedAt: Date.now(),
+            mode: sessionMode,
+            entries: entries.filter((entry) => entry.runId),
+          }),
+        );
+      } catch {
+        // 隐私模式下写不进去，不影响主流程
+      }
+    },
+    [],
+  );
 
   useEffect(() => {
     void loadStyles();
@@ -902,6 +945,7 @@ export default function Home() {
     setCopied({});
     setExpanded({});
     resetOutlineEditor();
+    setPendingSession(null);
     try {
       const res = await fetch("/api/run", {
         method: "POST",
@@ -911,6 +955,10 @@ export default function Home() {
       const data = (await res.json()) as { runId?: string; error?: string };
       if (!res.ok || !data.runId) throw new Error(data.error ?? `启动失败 ${res.status}`);
       setRunId(data.runId);
+      // 记下本次运行，刷新后能接回来
+      saveSession("single", [
+        { runId: data.runId, topic: value, label: "单次生成" },
+      ]);
       connectSingle(data.runId);
     } catch (err) {
       setRunStatus("failed");
@@ -956,10 +1004,18 @@ export default function Home() {
     setCopied({});
     setExpanded({});
     resetOutlineEditor();
+    setPendingSession(null);
     batchRunningRef.current = true;
 
     // 同一批任务共享 batchId，历史回看时聚合为一个批次
     const batchUuid = crypto.randomUUID();
+    // 已成功创建的任务：落本地会话，刷新后能接回已启动的部分
+    const created: {
+      runId: string;
+      topic: string;
+      label: string;
+      variant?: VariantKey;
+    }[] = [];
 
     for (let i = 0; i < initial.length; i++) {
       if (!batchRunningRef.current) {
@@ -988,6 +1044,13 @@ export default function Home() {
         setTasks((prev) =>
           prev.map((t, idx) => (idx === i ? { ...t, runId: data.runId } : t)),
         );
+        created.push({
+          runId: data.runId,
+          topic: initial[i].topic,
+          label: initial[i].label,
+          variant: initial[i].variant,
+        });
+        saveSession(mode, created);
         await connectTask(data.runId, i);
       } catch (err) {
         setTasks((prev) =>
@@ -1232,6 +1295,208 @@ export default function Home() {
       setNotice(err instanceof Error ? err.message : String(err));
     }
   }
+
+  /**
+   * 把快照载入正常视图（不是只读回看），载入后可以继续编辑提纲。
+   * 只在快照状态是 running 时连 SSE，终态不会凭空产生事件流。
+   */
+  function applySnapshotToView(snap: RunSnapshot) {
+    esRef.current?.close();
+    setReviewing(null);
+    setMode("single");
+    setTopic(snap.topic);
+    setNodes(snap.nodes);
+    setRunStatus(snap.status);
+    setRunId(snap.runId);
+    setReport(snap.report);
+    setCopied({});
+    setExpanded({});
+    setReconnectNotice("");
+    applyOutlineSnapshot(snap);
+    resetOutlineEditor();
+    if (snap.status === "running") connectSingle(snap.runId);
+  }
+
+  /**
+   * 批量会话恢复：只恢复已经拿到 runId 的任务。
+   * 刷新发生在队列中间时，未启动的任务不会被凭空补出来，避免出现永远待跑的 tab。
+   */
+  function applySnapshotsToBatch(
+    sessionMode: Mode,
+    items: {
+      topic: string;
+      label: string;
+      variant?: VariantKey;
+      snap: RunSnapshot;
+    }[],
+  ) {
+    const restored: TaskResult[] = items.map((item, index) => ({
+      id: `restored-${index}`,
+      topic: item.topic,
+      label: item.label,
+      variant: item.variant,
+      status:
+        item.snap.status === "running"
+          ? "running"
+          : item.snap.status === "failed"
+            ? "failed"
+            : item.snap.status === "aborted"
+              ? "aborted"
+              : "completed",
+      nodes: item.snap.nodes,
+      runId: item.snap.runId,
+      report: item.snap.report,
+    }));
+
+    esRef.current?.close();
+    setReviewing(null);
+    setMode(sessionMode);
+    setTasks(restored);
+    setActiveTaskIndex(0);
+    setCopied({});
+    setExpanded({});
+    setReconnectNotice("");
+    for (const item of items) applyOutlineSnapshot(item.snap);
+    resetOutlineEditor();
+
+    const runningIndex = restored.findIndex((task) => task.status === "running");
+    if (runningIndex >= 0 && restored[runningIndex].runId) {
+      void connectTask(restored[runningIndex].runId!, runningIndex);
+    }
+  }
+
+  // 历史批次「继续迭代」：接回内存后进入可编辑视图，不动原产出
+  async function resumeHistoryRun(entry: HistoryRunEntry) {
+    try {
+      const res = await fetch(`/api/run/${entry.runId}/resume`, {
+        method: "POST",
+      });
+      if (!res.ok) throw new Error("历史快照已不存在");
+      const snap = (await res.json()) as RunSnapshot;
+      applySnapshotToView(snap);
+      setHistoryOpen(false);
+      setNotice(`已接回「${snap.topic}」，可编辑提纲后局部重生成`);
+      saveSession("single", [
+        { runId: snap.runId, topic: snap.topic, label: "历史续跑" },
+      ]);
+    } catch (err) {
+      setNotice(err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  // 刷新后点「继续查看」：先把快照回灌进内存，再接回视图
+  async function resumePendingSession() {
+    const session = pendingSession;
+    if (!session) return;
+
+    const items: typeof session.items = [];
+    for (const item of session.items) {
+      try {
+        const res = await fetch(`/api/run/${item.snap.runId}/resume`, {
+          method: "POST",
+        });
+        if (!res.ok) continue;
+        items.push({ ...item, snap: (await res.json()) as RunSnapshot });
+      } catch {
+        // 单个任务回灌失败时跳过
+      }
+    }
+
+    setPendingSession(null);
+    if (items.length === 0) {
+      setNotice("上次任务的历史快照已不存在");
+      return;
+    }
+
+    if (session.mode === "single") applySnapshotToView(items[0].snap);
+    else applySnapshotsToBatch(session.mode, items);
+  }
+
+  function dismissPendingSession() {
+    setPendingSession(null);
+    try {
+      window.localStorage.removeItem(SESSION_KEY);
+    } catch {
+      // 存储不可用时只清内存态
+    }
+  }
+
+  // 首屏接回上次运行：运行中的直接接回去，已结束的只给一条提示，不抢屏
+  useEffect(() => {
+    let cancelled = false;
+
+    async function restoreSession() {
+      let saved: {
+        savedAt?: number;
+        mode?: Mode;
+        entries?: {
+          runId: string;
+          topic: string;
+          label: string;
+          variant?: VariantKey;
+        }[];
+      } | null = null;
+      try {
+        const raw = window.localStorage.getItem(SESSION_KEY);
+        if (!raw) return;
+        saved = JSON.parse(raw);
+      } catch {
+        return;
+      }
+
+      const entries = saved?.entries?.filter((entry) => entry?.runId) ?? [];
+      if (entries.length === 0) return;
+      if (Date.now() - (saved?.savedAt ?? 0) > SESSION_TTL) {
+        try {
+          window.localStorage.removeItem(SESSION_KEY);
+        } catch {
+          // 存储不可用时不处理
+        }
+        return;
+      }
+
+      const items: {
+        topic: string;
+        label: string;
+        variant?: VariantKey;
+        snap: RunSnapshot;
+      }[] = [];
+      for (const entry of entries) {
+        try {
+          const res = await fetch(`/api/run/${entry.runId}`, {
+            cache: "no-store",
+          });
+          if (!res.ok) continue;
+          items.push({
+            topic: entry.topic,
+            label: entry.label,
+            variant: entry.variant,
+            snap: (await res.json()) as RunSnapshot,
+          });
+        } catch {
+          // 单个任务取不到跳过，不影响其余恢复
+        }
+      }
+      if (cancelled || items.length === 0) return;
+
+      const sessionMode: Mode = saved?.mode ?? "single";
+      if (items.some((item) => item.snap.status === "running")) {
+        // 跑到一半的任务不能等用户点，直接接回并继续看流
+        if (sessionMode === "single") applySnapshotToView(items[0].snap);
+        else applySnapshotsToBatch(sessionMode, items);
+        setNotice("已接回刷新前的运行");
+      } else {
+        setPendingSession({ mode: sessionMode, items });
+      }
+    }
+
+    void restoreSession();
+    return () => {
+      cancelled = true;
+    };
+    // 只在首屏跑一次；接回函数内部只用到稳定的 setState
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   function exitReview() {
     setReviewing(null);
@@ -1610,22 +1875,30 @@ export default function Home() {
                   </div>
                   <div className="flex flex-wrap gap-2 px-3 py-2">
                     {batch.runs.map((run) => (
-                      <button
-                        key={run.runId}
-                        onClick={() => void openHistoryRun(run)}
-                        className={`max-w-[16rem] truncate rounded-md border px-2.5 py-1 text-xs transition ${
-                          reviewing?.runId === run.runId
-                            ? "border-accent bg-accent text-white"
-                            : "border-hairline-strong bg-surface text-ink-2 hover:border-ink-3 hover:text-ink"
-                        }`}
-                        title={run.topic}
-                      >
-                        {run.variantName ??
-                          (batch.runs.length === 1 ? "单次生成" : run.topic)}
-                        {run.durationMs !== null
-                          ? ` · ${formatDuration(run.durationMs)}`
-                          : ""}
-                      </button>
+                      <div key={run.runId} className="flex items-center gap-1">
+                        <button
+                          onClick={() => void openHistoryRun(run)}
+                          className={`max-w-[16rem] truncate rounded-md border px-2.5 py-1 text-xs transition ${
+                            reviewing?.runId === run.runId
+                              ? "border-accent bg-accent text-white"
+                              : "border-hairline-strong bg-surface text-ink-2 hover:border-ink-3 hover:text-ink"
+                          }`}
+                          title={run.topic}
+                        >
+                          {run.variantName ??
+                            (batch.runs.length === 1 ? "单次生成" : run.topic)}
+                          {run.durationMs !== null
+                            ? ` · ${formatDuration(run.durationMs)}`
+                            : ""}
+                        </button>
+                        <button
+                          onClick={() => void resumeHistoryRun(run)}
+                          className="rounded-md border border-hairline-strong px-2 py-1 text-xs text-ink-3 transition hover:border-accent hover:text-accent"
+                          title="接回可编辑视图，改动提纲只重跑受影响的渠道"
+                        >
+                          继续迭代
+                        </button>
+                      </div>
                     ))}
                   </div>
                 </li>
@@ -1865,6 +2138,34 @@ export default function Home() {
             className="ml-auto rounded-md border border-blue-300 bg-white px-2.5 py-1 text-xs text-blue-700"
           >
             退出回看
+          </button>
+        </div>
+      )}
+
+      {/* 上次任务提示：已结束的运行只提示不抢屏，点一下才载入 */}
+      {pendingSession && (
+        <div className="flex flex-wrap items-center gap-2 rounded-xl border border-hairline-strong bg-surface px-3 py-2 text-xs">
+          <span className="font-medium text-ink">上次任务</span>
+          <span className="max-w-[20rem] truncate text-ink-2">
+            {pendingSession.items.map((item) => item.topic).join(" / ")}
+          </span>
+          <span className="tabular-nums text-ink-3">
+            {formatTime(
+              pendingSession.items[0].snap.finishedAt ??
+                pendingSession.items[0].snap.createdAt,
+            )}
+          </span>
+          <button
+            onClick={() => void resumePendingSession()}
+            className="rounded-md border border-hairline-strong px-2 py-1 text-ink-2 transition hover:border-accent hover:text-accent"
+          >
+            继续查看
+          </button>
+          <button
+            onClick={dismissPendingSession}
+            className="rounded-md px-2 py-1 text-ink-3 transition hover:text-ink"
+          >
+            忽略
           </button>
         </div>
       )}
