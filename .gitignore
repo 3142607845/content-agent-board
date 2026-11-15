@@ -41,3 +41,9 @@ data/runs/
 
 # 运行时保存的自定义风格模板
 data/styles.json
+
+# 运行时保存的成品库
+data/library.json
+
+# 运行时保存的整批项目库
+data/projects.json
