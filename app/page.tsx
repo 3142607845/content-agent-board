@@ -183,6 +183,8 @@ const MODE_TABS: { id: Mode; label: string }[] = [
 const SESSION_KEY = "cab-last-run";
 /** 超过一天的上次任务不再提示，避免开屏被旧数据打扰 */
 const SESSION_TTL = 24 * 60 * 60 * 1000;
+/** 提纲撤销栈上限：只保留最近 20 次失焦变更，超出丢最早的一条 */
+const OUTLINE_HISTORY_LIMIT = 20;
 
 /** 示例选题：降低"不知道输入什么"的启动成本 */
 const EXAMPLE_TOPICS = [
@@ -494,6 +496,18 @@ export default function Home() {
   const [outlineError, setOutlineError] = useState("");
   const [outlineNotice, setOutlineNotice] = useState("");
   const [outlineBusy, setOutlineBusy] = useState(false);
+  /**
+   * 提纲编辑的本地撤销栈：只存草稿文本，纯前端，不落库也不上后端。
+   * 数据放 ref 里避免每次输入都触发重渲染，canUndo/canRedo 单独用 state 驱动按钮态。
+   */
+  const outlineHistory = useRef<{ entries: string[]; index: number }>({
+    entries: [],
+    index: -1,
+  });
+  const [outlineHistoryState, setOutlineHistoryState] = useState({
+    canUndo: false,
+    canRedo: false,
+  });
 
   /** 刷新后接回的上次任务：只存快照，点「继续查看」才载入，不抢屏 */
   const [pendingSession, setPendingSession] = useState<{
@@ -744,6 +758,79 @@ export default function Home() {
       },
     }));
   }, []);
+
+  // —— 提纲编辑的本地撤销 / 重做 ——
+  /** 把栈的当前位置同步到按钮可用态 */
+  const syncOutlineHistory = useCallback(() => {
+    const { entries, index } = outlineHistory.current;
+    setOutlineHistoryState({
+      canUndo: index > 0,
+      canRedo: index < entries.length - 1,
+    });
+  }, []);
+
+  /** 开一次编辑会话：用当前草稿做栈底，保证第一次撤销能回到初始内容 */
+  const seedOutlineHistory = useCallback(
+    (text: string) => {
+      outlineHistory.current = { entries: [text], index: 0 };
+      syncOutlineHistory();
+    },
+    [syncOutlineHistory],
+  );
+
+  /** 切换版本 / 提交 / 切任务时清空，避免撤销到另一个任务的草稿 */
+  const clearOutlineHistory = useCallback(() => {
+    outlineHistory.current = { entries: [], index: -1 };
+    syncOutlineHistory();
+  }, [syncOutlineHistory]);
+
+  /** 失焦时记一次变更：与栈顶相同的草稿不记，避免光标进出白占一格 */
+  const recordOutlineHistory = useCallback(
+    (text: string) => {
+      const history = outlineHistory.current;
+      if (history.entries[history.index] === text) return;
+      // 在历史中间继续编辑时丢弃「未来」分支，与常见编辑器行为一致
+      const kept = [...history.entries.slice(0, history.index + 1), text];
+      const trimmed = kept.slice(-OUTLINE_HISTORY_LIMIT);
+      outlineHistory.current = { entries: trimmed, index: trimmed.length - 1 };
+      syncOutlineHistory();
+    },
+    [syncOutlineHistory],
+  );
+
+  const undoOutline = useCallback(() => {
+    const history = outlineHistory.current;
+    if (history.index <= 0) return;
+    history.index -= 1;
+    setOutlineDraft(history.entries[history.index]);
+    setOutlineError("");
+    syncOutlineHistory();
+  }, [syncOutlineHistory]);
+
+  const redoOutline = useCallback(() => {
+    const history = outlineHistory.current;
+    if (history.index >= history.entries.length - 1) return;
+    history.index += 1;
+    setOutlineDraft(history.entries[history.index]);
+    setOutlineError("");
+    syncOutlineHistory();
+  }, [syncOutlineHistory]);
+
+  // 快捷键：焦点在文本域内交给浏览器原生撤销（字符级更细），在外部才接管 Ctrl/Cmd+Z
+  useEffect(() => {
+    if (!outlineEditing) return;
+    function handleKeyDown(event: KeyboardEvent) {
+      if (!(event.metaKey || event.ctrlKey)) return;
+      if (event.key.toLowerCase() !== "z") return;
+      const tag = (event.target as HTMLElement | null)?.tagName;
+      if (tag === "TEXTAREA" || tag === "INPUT") return;
+      event.preventDefault();
+      if (event.shiftKey) redoOutline();
+      else undoOutline();
+    }
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [outlineEditing, redoOutline, undoOutline]);
 
   /** 策划完成时快照里还没有版本链，单独拉一次全量快照补上 */
   const refreshOutline = useCallback(
@@ -1198,6 +1285,8 @@ export default function Home() {
       ? JSON.stringify(target.outline, null, 2)
       : currentNodes.planner.content.trim();
     setOutlineDraft(text);
+    // 换版本等于开新会话：旧版本上的编辑历史不应带过来
+    seedOutlineHistory(text);
     setOutlineSelectedVersion(target?.id ?? null);
     setOutlineEditing(true);
     setOutlineError("");
@@ -1210,6 +1299,7 @@ export default function Home() {
     setOutlineDraft("");
     setOutlineSelectedVersion(null);
     setOutlineError("");
+    clearOutlineHistory();
   }
 
   /** 新任务开始或进入回看时清空编辑态，避免上一个 run 的草稿串台 */
@@ -1219,6 +1309,7 @@ export default function Home() {
     setOutlineSelectedVersion(null);
     setOutlineError("");
     setOutlineNotice("");
+    clearOutlineHistory();
   }
 
   async function handleOutlineRegenerate() {
@@ -1256,6 +1347,8 @@ export default function Home() {
       }));
       setOutlineEditing(false);
       setOutlineSelectedVersion(null);
+      // 提交成功即关闭编辑会话，历史栈随之作废
+      clearOutlineHistory();
       setOutlineNotice(
         `已提交「${data.version.id} ${data.version.label}」，重生成范围：${(
           data.affected ?? []
@@ -2835,6 +2928,8 @@ export default function Home() {
                 onClick={() => {
                   setActiveTaskIndex(idx);
                   setCompareView(false);
+                  // 换任务后草稿归属变了，撤销栈必须清空，避免撤回上一个任务的内容
+                  clearOutlineHistory();
                 }}
                 className={`flex items-center gap-2 rounded-lg border px-3 py-1.5 text-xs transition ${
                   idx === activeTaskIndex && !compareView
@@ -3368,6 +3463,7 @@ export default function Home() {
                             onChange={(event) =>
                               setOutlineDraft(event.target.value)
                             }
+                            onBlur={() => recordOutlineHistory(outlineDraft)}
                             rows={16}
                             spellCheck={false}
                             className="max-h-96 w-full resize-y overflow-auto rounded-lg border border-hairline-strong bg-canvas p-3 font-mono text-[11px] leading-relaxed text-ink outline-none transition focus:border-accent"
@@ -3396,6 +3492,23 @@ export default function Home() {
                               {outlineBusy
                                 ? "提交中…"
                                 : "基于当前提纲重生成下游"}
+                            </button>
+                            {/* 撤销/重做只回退本地草稿，不触发任何模型调用 */}
+                            <button
+                              onClick={undoOutline}
+                              disabled={!outlineHistoryState.canUndo || outlineBusy}
+                              title="回到上一次失焦时的草稿（焦点不在输入框时按 Ctrl/Cmd+Z）"
+                              className="rounded-md border border-hairline-strong px-2.5 py-1.5 text-xs text-ink-2 transition hover:border-accent hover:text-accent disabled:cursor-not-allowed disabled:opacity-40"
+                            >
+                              撤销
+                            </button>
+                            <button
+                              onClick={redoOutline}
+                              disabled={!outlineHistoryState.canRedo || outlineBusy}
+                              title="恢复被撤销的修改（Ctrl/Cmd+Shift+Z）"
+                              className="rounded-md border border-hairline-strong px-2.5 py-1.5 text-xs text-ink-2 transition hover:border-accent hover:text-accent disabled:cursor-not-allowed disabled:opacity-40"
+                            >
+                              重做
                             </button>
                             {draftParse?.ok && !outlineChanged && (
                               <span className="text-[11px] text-ink-3">
