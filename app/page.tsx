@@ -547,6 +547,8 @@ export default function Home() {
     canUndo: false,
     canRedo: false,
   });
+  /** 进入编辑时的原始草稿：切任务时据此判断有没有未提交的修改 */
+  const outlineBaselineRef = useRef("");
 
   /** 单次模式当前 run 的创建时间，侧边栏展示与排序用 */
   const [singleCreatedAt, setSingleCreatedAt] = useState<number | null>(null);
@@ -764,6 +766,14 @@ export default function Home() {
     mode === "single" ? report : tasks[activeTaskIndex]?.report ?? null;
   const isRunning = currentTaskStatus === "running";
   const isCompleted = currentTaskStatus === "completed";
+  /**
+   * 是否还有流水线在跑：单次看当前视图，批量要看整批。
+   * 批量时用户可能切到已完成的任务，此时队列仍在推进，不能只看当前任务状态。
+   */
+  const hasLiveRun =
+    mode === "single"
+      ? isRunning
+      : tasks.some((t) => t.status === "running" || t.status === "pending");
 
   /**
    * 侧边栏任务列表：本次会话任务置顶，后面接服务端最近历史（最多 5 批）。
@@ -900,8 +910,13 @@ export default function Home() {
           {historyEntry && !sidebarCollapsed && (
             <button
               onClick={() => void resumeHistoryRun(historyEntry)}
-              title="接回可编辑视图，改动提纲只重跑受影响的渠道"
-              className="mr-1 shrink-0 rounded border border-hairline-strong px-1.5 py-0.5 text-[10px] text-ink-3 transition hover:border-accent hover:text-accent"
+              disabled={hasLiveRun}
+              title={
+                hasLiveRun
+                  ? "流水线运行中，结束后才能迭代历史任务"
+                  : "接回可编辑视图，改动提纲只重跑受影响的渠道"
+              }
+              className="mr-1 shrink-0 rounded border border-hairline-strong px-1.5 py-0.5 text-[10px] text-ink-3 transition hover:border-accent hover:text-accent disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:border-hairline-strong disabled:hover:text-ink-3"
             >
               迭代
             </button>
@@ -912,22 +927,43 @@ export default function Home() {
   }
 
   /**
-   * 侧边栏切任务：当前会话任务切 tab 视角，历史任务进只读回看。
-   * 两种都清空提纲撤销栈 —— 草稿归属变了，旧历史不能带过去。
+   * 切任务前的统一守护：草稿归属会变，不能悄悄丢掉或带到新任务上。
+   * 有未提交改动先确认；确认后一律清空编辑态（含撤销栈）。
+   */
+  function beginTaskSwitch(): boolean {
+    if (
+      outlineEditing &&
+      outlineDraft !== outlineBaselineRef.current &&
+      !window.confirm("当前提纲还有未提交的修改，切换任务会丢弃这些修改。继续？")
+    ) {
+      return false;
+    }
+    resetOutlineEditor();
+    return true;
+  }
+
+  /**
+   * 侧边栏切任务：当前会话任务切视图，历史任务进只读回看。
+   * 运行中不允许跳历史：openHistoryRun 会关闭当前 SSE，批量队列会因此卡住。
    */
   function selectSidebarTask(item: SidebarTaskItem) {
-    clearOutlineHistory();
-    if (item.source === "current" && item.taskIndex !== undefined) {
-      // 回看会临时切到单次视图，切回批量任务时把模式恢复回来
-      setReviewing(null);
-      setMode(item.batchMode ?? mode);
-      setActiveTaskIndex(item.taskIndex);
-      setCompareView(false);
-      setNotice("");
-      window.scrollTo({ top: 0, behavior: "smooth" });
+    if (item.source === "history") {
+      if (hasLiveRun) {
+        setNotice("流水线运行中，结束后再回看历史任务");
+        return;
+      }
+      if (!beginTaskSwitch() || !item.historyEntry) return;
+      void openHistoryRun(item.historyEntry);
       return;
     }
-    if (item.historyEntry) void openHistoryRun(item.historyEntry);
+    if (item.taskIndex === undefined || !beginTaskSwitch()) return;
+    // 回看会临时切到单次视图，切回批量任务时把模式恢复回来
+    setReviewing(null);
+    setMode(item.batchMode ?? mode);
+    setActiveTaskIndex(item.taskIndex);
+    setCompareView(false);
+    setNotice("");
+    window.scrollTo({ top: 0, behavior: "smooth" });
   }
 
   /** 新建流水线任务：清空当前结果回到输入区，历史与成品库不受影响 */
@@ -1550,6 +1586,7 @@ export default function Home() {
       ? JSON.stringify(target.outline, null, 2)
       : currentNodes.planner.content.trim();
     setOutlineDraft(text);
+    outlineBaselineRef.current = text;
     // 换版本等于开新会话：旧版本上的编辑历史不应带过来
     seedOutlineHistory(text);
     setOutlineSelectedVersion(target?.id ?? null);
@@ -1564,6 +1601,7 @@ export default function Home() {
     setOutlineDraft("");
     setOutlineSelectedVersion(null);
     setOutlineError("");
+    outlineBaselineRef.current = "";
     clearOutlineHistory();
   }
 
@@ -1574,6 +1612,7 @@ export default function Home() {
     setOutlineSelectedVersion(null);
     setOutlineError("");
     setOutlineNotice("");
+    outlineBaselineRef.current = "";
     clearOutlineHistory();
   }
 
@@ -1935,6 +1974,7 @@ export default function Home() {
 
   // 历史批次「继续迭代」：接回内存后进入可编辑视图，不动原产出
   async function resumeHistoryRun(entry: HistoryRunEntry) {
+    if (!beginTaskSwitch()) return;
     try {
       const res = await fetch(`/api/run/${entry.runId}/resume`, {
         method: "POST",
@@ -3257,10 +3297,9 @@ export default function Home() {
               <button
                 key={t.id}
                 onClick={() => {
+                  if (!beginTaskSwitch()) return;
                   setActiveTaskIndex(idx);
                   setCompareView(false);
-                  // 换任务后草稿归属变了，撤销栈必须清空，避免撤回上一个任务的内容
-                  clearOutlineHistory();
                 }}
                 className={`flex items-center gap-2 rounded-lg border px-3 py-1.5 text-xs transition ${
                   idx === activeTaskIndex && !compareView
@@ -3348,6 +3387,7 @@ export default function Home() {
                     <button
                       type="button"
                       onClick={() => {
+                        if (!beginTaskSwitch()) return;
                         setActiveTaskIndex(idx);
                         setCompareView(false);
                       }}
@@ -3400,12 +3440,14 @@ export default function Home() {
                               role="button"
                               tabIndex={0}
                               onClick={() => {
+                                if (!beginTaskSwitch()) return;
                                 setActiveTaskIndex(idx);
                                 setCompareView(false);
                               }}
                               onKeyDown={(e) => {
                                 if (e.key === "Enter" || e.key === " ") {
                                   e.preventDefault();
+                                  if (!beginTaskSwitch()) return;
                                   setActiveTaskIndex(idx);
                                   setCompareView(false);
                                 }
