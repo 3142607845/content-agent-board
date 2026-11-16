@@ -469,6 +469,8 @@ export default function Home() {
   const [projectItems, setProjectItems] = useState<ProjectItem[]>([]);
   const [libraryTab, setLibraryTab] = useState<"card" | "project">("card");
   const [projectBusy, setProjectBusy] = useState(false);
+  // 批量/多版模式：横向对比视图，把多个任务的四路产出并排展示
+  const [compareView, setCompareView] = useState(false);
 
   // 风格模板：内置 + 自定义全量列表，按渠道过滤使用
   const [styleTemplates, setStyleTemplates] = useState<StyleTemplate[]>([]);
@@ -2818,35 +2820,67 @@ export default function Home() {
         </div>
       )}
 
-      {/* 批量模式 tabs */}
-      {mode !== "single" && tasks.length > 0 && (
-        <div className="flex flex-wrap gap-2">
-          {tasks.map((t, idx) => (
-            <button
-              key={t.id}
-              onClick={() => setActiveTaskIndex(idx)}
-              className={`flex items-center gap-2 rounded-lg border px-3 py-1.5 text-xs transition ${
-                idx === activeTaskIndex
+      {/* 批量模式 tabs：任务未创建时也保留这一行，保证「横向对比」入口始终可见 */}
+      {mode !== "single" && (
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div className="flex flex-wrap gap-2">
+            {tasks.length === 0 && (
+              <span className="text-xs text-ink-3">
+                输入多行选题并开始生成后，这里会出现任务切换
+              </span>
+            )}
+            {tasks.map((t, idx) => (
+              <button
+                key={t.id}
+                onClick={() => {
+                  setActiveTaskIndex(idx);
+                  setCompareView(false);
+                }}
+                className={`flex items-center gap-2 rounded-lg border px-3 py-1.5 text-xs transition ${
+                  idx === activeTaskIndex && !compareView
+                    ? "border-accent bg-accent text-white"
+                    : "border-hairline bg-surface text-ink-2 hover:text-ink"
+                }`}
+              >
+                <span
+                  className={`h-2 w-2 rounded-full ${
+                    t.status === "completed"
+                      ? "bg-green-500"
+                      : t.status === "running"
+                        ? "bg-blue-500 animate-pulse"
+                        : t.status === "failed"
+                          ? "bg-red-500"
+                          : t.status === "aborted"
+                            ? "bg-amber-500"
+                            : "bg-neutral-300"
+                  }`}
+                />
+                {t.label}
+              </button>
+            ))}
+          </div>
+          {/*
+            横向对比：始终渲染，任务不足两个时置灰。
+            直接隐藏按钮会让用户不知道有这个功能、也不知道为什么没有。
+          */}
+          <button
+            onClick={() => setCompareView((v) => !v)}
+            disabled={tasks.length < 2}
+            className={`rounded-lg border px-3 py-1.5 text-xs transition ${
+              tasks.length < 2
+                ? "cursor-not-allowed border-hairline bg-surface text-ink-3 opacity-50"
+                : compareView
                   ? "border-accent bg-accent text-white"
                   : "border-hairline bg-surface text-ink-2 hover:text-ink"
-              }`}
-            >
-              <span
-                className={`h-2 w-2 rounded-full ${
-                  t.status === "completed"
-                    ? "bg-green-500"
-                    : t.status === "running"
-                      ? "bg-blue-500 animate-pulse"
-                      : t.status === "failed"
-                        ? "bg-red-500"
-                        : t.status === "aborted"
-                          ? "bg-amber-500"
-                          : "bg-neutral-300"
-                }`}
-              />
-              {t.label}
-            </button>
-          ))}
+            }`}
+            title={
+              tasks.length < 2
+                ? "至少需要 2 个任务才能对比，请在上方输入多行选题后开始生成"
+                : "把多个任务的四路产出并排对比"
+            }
+          >
+            横向对比
+          </button>
         </div>
       )}
 
@@ -2872,6 +2906,182 @@ export default function Home() {
         </div>
       </div>
 
+      {compareView && mode !== "single" ? (
+        <div className="overflow-x-auto rounded-lg border border-hairline">
+          <table className="min-w-full border-collapse text-left">
+            <thead>
+              <tr className="border-b border-hairline bg-canvas">
+                <th className="sticky left-0 z-10 w-28 shrink-0 bg-canvas px-3 py-2 text-xs font-semibold text-ink">
+                  渠道
+                </th>
+                {tasks.map((t, idx) => (
+                  <th
+                    key={t.id}
+                    className="min-w-[14rem] px-3 py-2 align-top"
+                  >
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setActiveTaskIndex(idx);
+                        setCompareView(false);
+                      }}
+                      className="flex w-full flex-col gap-0.5 text-left hover:text-accent"
+                    >
+                      <span
+                        className="truncate text-xs font-semibold text-ink"
+                        title={t.topic}
+                      >
+                        {t.topic}
+                      </span>
+                      <span className="text-[11px] text-ink-3">
+                        {t.variant
+                          ? `${VARIANTS.find((v) => v.key === t.variant)?.name ?? t.variant} · `
+                          : ""}
+                        {t.label}
+                      </span>
+                    </button>
+                  </th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {(["longform", "script", "xhs", "image"] as const).map(
+                (channel) => (
+                  <tr
+                    key={channel}
+                    className="border-b border-hairline last:border-0"
+                  >
+                    <td className="sticky left-0 z-10 w-28 shrink-0 bg-canvas px-3 py-2 align-top">
+                      <span className="text-xs font-medium text-ink-2">
+                        {NODE_META[channel].name}
+                      </span>
+                    </td>
+                    {tasks.map((t, idx) => {
+                      const node = t.nodes[channel];
+                      const hasContent =
+                        node.status === "completed" &&
+                        (channel === "image"
+                          ? !!node.imageUrl
+                          : !!node.content?.trim());
+                      const content = node.content ?? "";
+                      return (
+                        <td
+                          key={t.id}
+                          className="px-3 py-2 align-top"
+                        >
+                          {hasContent ? (
+                            <div
+                              role="button"
+                              tabIndex={0}
+                              onClick={() => {
+                                setActiveTaskIndex(idx);
+                                setCompareView(false);
+                              }}
+                              onKeyDown={(e) => {
+                                if (e.key === "Enter" || e.key === " ") {
+                                  e.preventDefault();
+                                  setActiveTaskIndex(idx);
+                                  setCompareView(false);
+                                }
+                              }}
+                              className="group relative block w-full cursor-pointer rounded-md p-1.5 text-left transition hover:bg-surface"
+                            >
+                              {channel === "image" ? (
+                                // eslint-disable-next-line @next/next/no-img-element
+                                <img
+                                  src={node.imageUrl ?? undefined}
+                                  alt="配图"
+                                  className="max-h-28 w-full rounded object-contain"
+                                />
+                              ) : (
+                                <>
+                                  <p className="line-clamp-2 whitespace-pre-wrap break-words text-xs text-ink-2">
+                                    {content}
+                                  </p>
+                                  {/* hover 预览全文，pointer-events-none 避免挡住点击 */}
+                                  <div className="pointer-events-none absolute left-0 right-0 top-full z-20 mt-1 max-h-52 overflow-auto rounded-md border border-hairline bg-surface p-2 text-[11px] leading-relaxed text-ink-2 opacity-0 shadow-lg transition group-hover:opacity-100">
+                                    <div className="whitespace-pre-wrap break-words">
+                                      {content}
+                                    </div>
+                                  </div>
+                                </>
+                              )}
+                              <span
+                                className="mt-1 flex gap-1"
+                                onClick={(e) => e.stopPropagation()}
+                              >
+                                {channel !== "image" ? (
+                                  <>
+                                    <button
+                                      type="button"
+                                      onClick={() => {
+                                        void navigator.clipboard
+                                          .writeText(content)
+                                          .then(() =>
+                                            setNotice("已复制到剪贴板"),
+                                          )
+                                          .catch(() =>
+                                            setNotice("复制失败"),
+                                          );
+                                      }}
+                                      className="rounded border border-hairline-strong px-1.5 py-0.5 text-[10px] text-ink-3 transition hover:border-accent hover:text-accent"
+                                    >
+                                      复制
+                                    </button>
+                                    <button
+                                      type="button"
+                                      onClick={() => {
+                                        const a = document.createElement("a");
+                                        a.href = URL.createObjectURL(
+                                          new Blob([content], {
+                                            type: "text/markdown;charset=utf-8",
+                                          }),
+                                        );
+                                        a.download = `${t.topic}-${NODE_META[channel].name}.md`;
+                                        document.body.appendChild(a);
+                                        a.click();
+                                        document.body.removeChild(a);
+                                        URL.revokeObjectURL(a.href);
+                                      }}
+                                      className="rounded border border-hairline-strong px-1.5 py-0.5 text-[10px] text-ink-3 transition hover:border-accent hover:text-accent"
+                                    >
+                                      下载
+                                    </button>
+                                  </>
+                                ) : (
+                                  <a
+                                    href={node.imageUrl ?? undefined}
+                                    target="_blank"
+                                    rel="noreferrer"
+                                    download
+                                    className="rounded border border-hairline-strong px-1.5 py-0.5 text-[10px] text-ink-3 transition hover:border-accent hover:text-accent"
+                                  >
+                                    查看原图
+                                  </a>
+                                )}
+                                <span className="ml-auto text-[10px] text-ink-3">
+                                  点击查看完整 →
+                                </span>
+                              </span>
+                            </div>
+                          ) : (
+                            <span className="text-xs text-ink-3">
+                              {node.status === "completed"
+                                ? "（无内容）"
+                                : "未完成"}
+                            </span>
+                          )}
+                        </td>
+                      );
+                    })}
+                  </tr>
+                ),
+              )}
+            </tbody>
+          </table>
+        </div>
+      ) : (
+      <>
       {/* 卡片区：hover 时其余卡片退到背景，聚焦当前节点 */}
       <div
         className="node-grid reveal grid grid-cols-1 gap-4 md:grid-cols-2 md:items-start xl:grid-cols-4"
@@ -3282,6 +3492,8 @@ export default function Home() {
           );
         })}
       </div>
+      </>
+      )}
 
       {/* 空态提示：还没跑过任何任务时告诉用户下一步做什么 */}
       {!isRunning &&
