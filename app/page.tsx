@@ -228,6 +228,8 @@ const OUTLINE_HISTORY_LIMIT = 20;
 const OUTLINE_AUTOSAVE_MS = 1200;
 /** API 连接状态探测间隔：30 秒内服务端断开能被发现，又不会频繁打扰后端 */
 const API_POLL_MS = 30 * 1000;
+/** 历史保留批次数：与 lib/history.ts 的 MAX_BATCHES 对齐，这里只用于提示文案 */
+const HISTORY_BATCH_LIMIT = 5;
 
 /** 示例选题：降低"不知道输入什么"的启动成本 */
 const EXAMPLE_TOPICS = [
@@ -275,7 +277,7 @@ interface TaskResult {
   label: string;
   /** 多版模式：该任务对应的创作维度 */
   variant?: VariantKey;
-  status: "pending" | "running" | "completed" | "failed" | "aborted";
+  status: "queued" | "pending" | "running" | "completed" | "failed" | "aborted";
   nodes: Record<NodeId, AgentNodeState>;
   runId?: string;
   /** 创建时间：侧边栏按它排序并展示，刷新恢复时取快照里的值 */
@@ -293,7 +295,14 @@ interface SidebarTaskItem {
   title: string;
   tag: string;
   createdAt: number;
-  status: "idle" | "pending" | "running" | "completed" | "failed" | "aborted";
+  status:
+    | "idle"
+    | "queued"
+    | "pending"
+    | "running"
+    | "completed"
+    | "failed"
+    | "aborted";
   /** current：本次会话内存任务；history：服务端落盘快照 */
   source: "current" | "history";
   /** 批量/多版任务在 tasks 里的下标 */
@@ -818,7 +827,12 @@ export default function Home() {
   const hasLiveRun =
     mode === "single"
       ? isRunning
-      : tasks.some((t) => t.status === "running" || t.status === "pending");
+      : tasks.some(
+          (t) =>
+            t.status === "running" ||
+            t.status === "pending" ||
+            t.status === "queued",
+        );
 
   /**
    * 侧边栏任务列表：本次会话任务置顶，后面接服务端最近历史（最多 5 批）。
@@ -945,6 +959,11 @@ export default function Home() {
                   <span className="shrink-0 rounded border border-hairline bg-canvas px-1 py-0.5">
                     {item.tag}
                   </span>
+                  {item.source === "current" && item.status === "queued" && (
+                    <span className="shrink-0 rounded border border-amber-200 bg-amber-50 px-1 py-0.5 text-amber-700">
+                      排队中
+                    </span>
+                  )}
                   <span className="shrink-0 tabular-nums">
                     {item.createdAt > 0 ? formatTime(item.createdAt) : ""}
                   </span>
@@ -1013,7 +1032,11 @@ export default function Home() {
 
   /** 新建流水线任务：清空当前结果回到输入区，历史与成品库不受影响 */
   function handleNewTask() {
-    if (isRunning) return;
+    // 批量队列可能正跑在别的任务上，不能只看当前视图
+    if (hasLiveRun) {
+      setNotice("流水线运行中，结束后再新建任务");
+      return;
+    }
     esRef.current?.close();
     setReviewing(null);
     setSettingsOpen(false);
@@ -1584,7 +1607,7 @@ export default function Home() {
       topic: t.topic,
       label: t.label,
       variant: t.variant,
-      status: "pending",
+      status: "queued",
       nodes: emptyNodes(),
       createdAt: Date.now(),
     }));
@@ -1664,7 +1687,9 @@ export default function Home() {
       esRef.current?.close();
       setTasks((prev) =>
         prev.map((t) =>
-          t.status === "running" || t.status === "pending"
+          t.status === "running" ||
+          t.status === "pending" ||
+          t.status === "queued"
             ? { ...t, status: "aborted" }
             : t,
         ),
@@ -2279,6 +2304,39 @@ export default function Home() {
     resetOutlineEditor();
   }
 
+  /** 删除一个历史批次：整批删，删的是落盘文件，不影响内存里正在跑的任务 */
+  async function handleDeleteHistoryBatch(
+    batchId: string,
+    title: string,
+    runIds: string[],
+  ) {
+    if (
+      !window.confirm(
+        `删除「${title}」这一批 ${runIds.length} 个任务？删除后无法恢复，成品库里收藏的卡片不受影响。`,
+      )
+    ) {
+      return;
+    }
+    try {
+      const res = await fetch(
+        `/api/history?batchId=${encodeURIComponent(batchId)}`,
+        { method: "DELETE" },
+      );
+      if (!res.ok) {
+        const body = (await res.json().catch(() => null)) as {
+          error?: string;
+        } | null;
+        throw new Error(body?.error ?? `删除失败（${res.status}）`);
+      }
+      // 正在回看的就是这批：先退出，避免对着已删数据继续编辑
+      if (reviewing && runIds.includes(reviewing.runId)) exitReview();
+      await loadHistory();
+      setNotice("已删除该批历史任务");
+    } catch (err) {
+      setNotice(err instanceof Error ? err.message : String(err));
+    }
+  }
+
   // 引导：结束并记住，下次不再自动弹出
   function finishTour() {
     setTourStep(0);
@@ -2409,7 +2467,8 @@ export default function Home() {
   }
 
   function switchMode(next: Mode) {
-    if (isRunning) return;
+    // 切模式会清空任务列表，批量队列还在跑时同样要拦住
+    if (hasLiveRun) return;
     // 回看态下切模式视为离开回看，避免历史内容与新模式的空态混在一起
     if (reviewing) exitReview();
     setMode(next);
@@ -2426,6 +2485,8 @@ export default function Home() {
   // 批量模式全局进度：只把 completed 计入已完成，失败/中断单独统计
   const batchTotal = tasks.length;
   const batchCompleted = tasks.filter((t) => t.status === "completed").length;
+  /** 排队中的任务数：串行队列里用户看不到进度，需要单独给个数字 */
+  const batchQueued = tasks.filter((t) => t.status === "queued").length;
   const batchFailed = tasks.filter((t) => t.status === "failed").length;
   const batchAborted = tasks.filter((t) => t.status === "aborted").length;
   const batchRunning = tasks.find((t) => t.status === "running");
@@ -2575,6 +2636,19 @@ export default function Home() {
                       <span className="shrink-0 tabular-nums">
                         {formatTime(group.createdAt)}
                       </span>
+                      <button
+                        onClick={() =>
+                          void handleDeleteHistoryBatch(
+                            group.key,
+                            group.title,
+                            group.items.map((item) => item.key),
+                          )
+                        }
+                        title="删除这一批历史任务"
+                        className="shrink-0 rounded px-1 text-[10px] text-ink-3 transition hover:text-red-600"
+                      >
+                        删除
+                      </button>
                     </p>
                   )}
                   <ul className="flex flex-col gap-1">
@@ -2589,15 +2663,20 @@ export default function Home() {
               )}
             </ul>
             )}
+            {!sidebarCollapsed && sidebarHistoryGroups.length > 0 && (
+              <p className="px-2 pt-2 text-[10px] leading-relaxed text-ink-3">
+                本地保留最近 {HISTORY_BATCH_LIMIT} 批，重要产出请收藏到成品库
+              </p>
+            )}
           </div>
 
           {/* 功能菜单 */}
           <div className="border-t border-hairline px-2 py-2">
             <button
               onClick={handleNewTask}
-              disabled={isRunning}
+              disabled={hasLiveRun}
               title={
-                isRunning
+                hasLiveRun
                   ? "流水线运行中，结束后才能新建任务"
                   : "清空当前结果，开始新一轮"
               }
@@ -3255,7 +3334,7 @@ export default function Home() {
             <button
               key={tab.id}
               onClick={() => switchMode(tab.id)}
-              disabled={isRunning}
+              disabled={hasLiveRun}
               className={`flex-1 rounded-md px-4 py-2 text-sm font-medium transition disabled:opacity-40 ${
                 mode === tab.id
                   ? "bg-surface text-ink shadow-card"
@@ -3477,6 +3556,7 @@ export default function Home() {
                 : batchCompleted === batchTotal
                   ? "，全部完成"
                   : ""}
+              {batchQueued > 0 ? `，排队 ${batchQueued}` : ""}
             </span>
             {batchFailed > 0 && (
               <span className="text-red-600">失败 {batchFailed}</span>
@@ -3541,6 +3621,9 @@ export default function Home() {
                   }`}
                 />
                 {t.label}
+                {t.status === "queued" && (
+                  <span className="text-[10px] opacity-70">排队</span>
+                )}
               </button>
             ))}
           </div>

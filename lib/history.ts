@@ -167,6 +167,29 @@ export async function listHistoryBatches(
 }
 
 /**
+ * 删除指定批次，返回实际删掉的文件数（0 表示批次已不存在）。
+ *
+ * 整批删除而不是逐个删，理由和 pruneBatches 一样：留一半会让回看出现
+ * 「3 版里少 1 版」的错觉。这里只删磁盘文件，正在内存里跑的任务不受影响。
+ */
+export async function deleteHistoryBatch(batchId: string): Promise<number> {
+  if (!RUN_ID_PATTERN.test(batchId)) return 0;
+  const batches = await listHistoryBatches(Number.MAX_SAFE_INTEGER);
+  const target = batches.find((batch) => batch.batchId === batchId);
+  if (!target) return 0;
+  let deleted = 0;
+  for (const run of target.runs) {
+    try {
+      await fs.unlink(filePathFor(run.runId));
+      deleted += 1;
+    } catch {
+      // 并发删除或文件已不存在，忽略
+    }
+  }
+  return deleted;
+}
+
+/**
  * 只保留最近 MAX_BATCHES 个批次，超出时整批删除。
  *
  * 整批删除而不是逐个文件删，避免同一批次只剩一半版本、
