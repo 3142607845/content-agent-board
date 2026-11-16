@@ -27,7 +27,11 @@ interface ParticleLayerOptions {
 export default function BackgroundScene({ active }: BackgroundSceneProps) {
   const hostRef = useRef<HTMLDivElement | null>(null);
   const activeRef = useRef(active);
-  activeRef.current = active;
+
+  // 渲染循环跑在 effect 里，只需在提交后同步最新状态，不在渲染期写 ref
+  useEffect(() => {
+    activeRef.current = active;
+  }, [active]);
 
   useEffect(() => {
     const host = hostRef.current;

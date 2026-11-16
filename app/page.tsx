@@ -669,7 +669,9 @@ export default function Home() {
   }, []);
 
   // 首次进入拉一次：历史入口与成品库/项目库数量在刷新后仍然有内容
+  // 三个请求都是 await 之后才 setState，规则看不到 await 边界，挂载期拉取远端数据属正常用法
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     void loadHistory();
     void loadLibrary();
     void loadProjects();
@@ -752,12 +754,16 @@ export default function Home() {
   );
 
   useEffect(() => {
+    // 同上：模板列表在 await 之后才写入状态，挂载期拉取一次即可
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     void loadStyles();
   }, [loadStyles]);
 
   // 首次访问自动弹引导；已看过或存储不可用时安静跳过
   useEffect(() => {
     try {
+      // 是否弹过引导只有浏览器能判断，SSR 阶段无从得知，惰性初始化会造成 hydration 不一致
+      // eslint-disable-next-line react-hooks/set-state-in-effect
       if (window.localStorage.getItem("cab-guide-seen") !== "1") setTourStep(1);
     } catch {
       // 隐私模式读不到 localStorage，不打扰用户
