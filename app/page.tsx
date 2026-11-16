@@ -185,6 +185,8 @@ const SESSION_KEY = "cab-last-run";
 const SESSION_TTL = 24 * 60 * 60 * 1000;
 /** 提纲撤销栈上限：只保留最近 20 次失焦变更，超出丢最早的一条 */
 const OUTLINE_HISTORY_LIMIT = 20;
+/** API 连接状态探测间隔：30 秒内服务端断开能被发现，又不会频繁打扰后端 */
+const API_POLL_MS = 30 * 1000;
 
 /** 示例选题：降低"不知道输入什么"的启动成本 */
 const EXAMPLE_TOPICS = [
@@ -235,8 +237,46 @@ interface TaskResult {
   status: "pending" | "running" | "completed" | "failed" | "aborted";
   nodes: Record<NodeId, AgentNodeState>;
   runId?: string;
+  /** 创建时间：侧边栏按它排序并展示，刷新恢复时取快照里的值 */
+  createdAt: number;
   /** 该任务跑完后由服务端下发的执行报告 */
   report?: RunReport | null;
+}
+
+/**
+ * 侧边栏任务条目：把「本次会话的内存任务」和「服务端历史快照」统一成一个展示模型。
+ * 平台标签位暂时用创作维度/模式代替 —— 现有 run 没有真实平台字段。
+ */
+interface SidebarTaskItem {
+  key: string;
+  title: string;
+  tag: string;
+  createdAt: number;
+  status: "idle" | "pending" | "running" | "completed" | "failed" | "aborted";
+  /** current：本次会话内存任务；history：服务端落盘快照 */
+  source: "current" | "history";
+  /** 批量/多版任务在 tasks 里的下标 */
+  taskIndex?: number;
+  /** 批量条目所属运行模式，切回时用来恢复 tab */
+  batchMode?: Mode;
+  /** 历史条目原样保留，点击时直接交给 openHistoryRun */
+  historyEntry?: HistoryRunEntry;
+}
+
+/** 侧边栏状态点：与任务 tab、节点卡片共用同一套颜色语义 */
+function sidebarStatusDot(status: SidebarTaskItem["status"]): string {
+  switch (status) {
+    case "running":
+      return "bg-blue-500 animate-pulse";
+    case "completed":
+      return "bg-green-500";
+    case "failed":
+      return "bg-red-500";
+    case "aborted":
+      return "bg-amber-500";
+    default:
+      return "bg-neutral-300";
+  }
 }
 
 /** 历史回看态：只读展示落盘快照，不建立 SSE 连接 */
@@ -459,7 +499,6 @@ export default function Home() {
 
   // 历史回看：批次列表来自服务端落盘快照，不依赖当前内存态
   const [historyBatches, setHistoryBatches] = useState<HistoryBatch[]>([]);
-  const [historyOpen, setHistoryOpen] = useState(false);
   const [reviewing, setReviewing] = useState<ReviewingState | null>(null);
 
   // 成品库：与历史批次解耦，用户主动保存的产出不被 5 批上限淘汰
@@ -508,6 +547,15 @@ export default function Home() {
     canUndo: false,
     canRedo: false,
   });
+
+  /** 单次模式当前 run 的创建时间，侧边栏展示与排序用 */
+  const [singleCreatedAt, setSingleCreatedAt] = useState<number | null>(null);
+
+  // 侧边栏：折叠只影响界面，不参与任何流水线状态
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  /** null 表示尚未探测完成，避免首屏先闪一下「未连接」 */
+  const [apiOnline, setApiOnline] = useState<boolean | null>(null);
 
   /** 刷新后接回的上次任务：只存快照，点「继续查看」才载入，不抢屏 */
   const [pendingSession, setPendingSession] = useState<{
@@ -570,6 +618,30 @@ export default function Home() {
     void loadLibrary();
     void loadProjects();
   }, [loadHistory, loadLibrary, loadProjects]);
+
+  // API 连接状态：复用历史接口做轻量探测，切回前台立刻补测一次
+  useEffect(() => {
+    let cancelled = false;
+    async function probe() {
+      try {
+        const res = await fetch("/api/history", { cache: "no-store" });
+        if (!cancelled) setApiOnline(res.ok);
+      } catch {
+        if (!cancelled) setApiOnline(false);
+      }
+    }
+    void probe();
+    const timer = window.setInterval(() => void probe(), API_POLL_MS);
+    function handleVisible() {
+      if (document.visibilityState === "visible") void probe();
+    }
+    document.addEventListener("visibilitychange", handleVisible);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+      document.removeEventListener("visibilitychange", handleVisible);
+    };
+  }, []);
 
   const loadStyles = useCallback(async () => {
     try {
@@ -692,6 +764,197 @@ export default function Home() {
     mode === "single" ? report : tasks[activeTaskIndex]?.report ?? null;
   const isRunning = currentTaskStatus === "running";
   const isCompleted = currentTaskStatus === "completed";
+
+  /**
+   * 侧边栏任务列表：本次会话任务置顶，后面接服务端最近历史（最多 5 批）。
+   * 当前会话的 runId 已在历史里落盘时跳过，避免同一条任务出现两次。
+   */
+  const sidebarCurrent: SidebarTaskItem[] = [];
+  if (mode === "single") {
+    if (runId) {
+      sidebarCurrent.push({
+        key: runId,
+        title: currentTopic || "未命名选题",
+        // 回看态优先展示快照里的创作维度名
+        tag: reviewing?.variantName ?? "四路并行",
+        createdAt: singleCreatedAt ?? 0,
+        status:
+          currentTaskStatus === "idle"
+            ? "pending"
+            : (currentTaskStatus as SidebarTaskItem["status"]),
+        source: "current",
+      });
+    }
+  } else {
+    tasks.forEach((task, index) => {
+      sidebarCurrent.push({
+        key: task.id,
+        title: task.topic,
+        tag: task.variant ? variantLabel(task.variant) : task.label,
+        createdAt: task.createdAt,
+        status: task.status,
+        source: "current",
+        taskIndex: index,
+        batchMode: mode,
+      });
+    });
+  }
+  const currentSessionRunIds = new Set(sidebarCurrent.map((item) => item.key));
+
+  /** 历史按批次分组：同一批的多版任务收成一组，避免平铺成十几条 */
+  const sidebarHistoryGroups: {
+    key: string;
+    title: string;
+    createdAt: number;
+    items: SidebarTaskItem[];
+  }[] = [];
+  for (const batch of historyBatches) {
+    const items: SidebarTaskItem[] = [];
+    for (const run of batch.runs) {
+      if (currentSessionRunIds.has(run.runId)) continue;
+      items.push({
+        key: run.runId,
+        title: run.topic,
+        tag: run.variantName ?? "四路并行",
+        createdAt: run.createdAt,
+        status: run.status,
+        source: "history",
+        historyEntry: run,
+      });
+    }
+    if (items.length === 0) continue;
+    sidebarHistoryGroups.push({
+      key: batch.batchId,
+      // 批量选题批次用「N 个选题」做组标题，单条批次直接用选题
+      title:
+        batch.topics.length > 1
+          ? `${batch.topics.length} 个选题`
+          : batch.topics[0] ?? "历史任务",
+      createdAt: batch.createdAt,
+      items,
+    });
+  }
+  sidebarHistoryGroups.sort((a, b) => b.createdAt - a.createdAt);
+  const sidebarTaskCount =
+    sidebarCurrent.length +
+    sidebarHistoryGroups.reduce((sum, group) => sum + group.items.length, 0);
+
+  function isSidebarTaskActive(item: SidebarTaskItem): boolean {
+    if (item.source === "history") return reviewing?.runId === item.key;
+    if (item.taskIndex !== undefined) {
+      return (
+        !reviewing &&
+        mode !== "single" &&
+        item.taskIndex === activeTaskIndex &&
+        !compareView
+      );
+    }
+    return Boolean(runId) && runId === item.key;
+  }
+
+  /** 侧边栏单条任务：历史条目额外给一个「迭代」入口 */
+  function renderSidebarTask(item: SidebarTaskItem) {
+    const active = isSidebarTaskActive(item);
+    const historyEntry = item.historyEntry;
+    return (
+      <li key={item.key}>
+        <div
+          className={`flex items-center gap-1 rounded-lg border transition ${
+            active
+              ? "border-accent/40 bg-accent/10"
+              : "border-transparent hover:bg-canvas"
+          }`}
+        >
+          <button
+            onClick={() => selectSidebarTask(item)}
+            title={`${item.title} · ${item.tag}${
+              item.createdAt > 0 ? ` · ${formatTime(item.createdAt)}` : ""
+            }`}
+            className={`flex min-w-0 flex-1 items-center gap-2 rounded-lg px-2 py-2 text-left ${
+              sidebarCollapsed ? "justify-center" : ""
+            }`}
+          >
+            <span
+              className={`h-2 w-2 shrink-0 rounded-full ${sidebarStatusDot(item.status)}`}
+            />
+            {!sidebarCollapsed && (
+              <span className="min-w-0 flex-1">
+                <span
+                  className={`block truncate text-xs ${
+                    active ? "font-medium text-accent" : "text-ink"
+                  }`}
+                >
+                  {item.title}
+                </span>
+                <span className="mt-1 flex items-center gap-1.5 text-[10px] text-ink-3">
+                  <span className="shrink-0 rounded border border-hairline bg-canvas px-1 py-0.5">
+                    {item.tag}
+                  </span>
+                  <span className="shrink-0 tabular-nums">
+                    {item.createdAt > 0 ? formatTime(item.createdAt) : ""}
+                  </span>
+                </span>
+              </span>
+            )}
+          </button>
+          {historyEntry && !sidebarCollapsed && (
+            <button
+              onClick={() => void resumeHistoryRun(historyEntry)}
+              title="接回可编辑视图，改动提纲只重跑受影响的渠道"
+              className="mr-1 shrink-0 rounded border border-hairline-strong px-1.5 py-0.5 text-[10px] text-ink-3 transition hover:border-accent hover:text-accent"
+            >
+              迭代
+            </button>
+          )}
+        </div>
+      </li>
+    );
+  }
+
+  /**
+   * 侧边栏切任务：当前会话任务切 tab 视角，历史任务进只读回看。
+   * 两种都清空提纲撤销栈 —— 草稿归属变了，旧历史不能带过去。
+   */
+  function selectSidebarTask(item: SidebarTaskItem) {
+    clearOutlineHistory();
+    if (item.source === "current" && item.taskIndex !== undefined) {
+      // 回看会临时切到单次视图，切回批量任务时把模式恢复回来
+      setReviewing(null);
+      setMode(item.batchMode ?? mode);
+      setActiveTaskIndex(item.taskIndex);
+      setCompareView(false);
+      setNotice("");
+      window.scrollTo({ top: 0, behavior: "smooth" });
+      return;
+    }
+    if (item.historyEntry) void openHistoryRun(item.historyEntry);
+  }
+
+  /** 新建流水线任务：清空当前结果回到输入区，历史与成品库不受影响 */
+  function handleNewTask() {
+    if (isRunning) return;
+    esRef.current?.close();
+    setReviewing(null);
+    setSettingsOpen(false);
+    setCompareView(false);
+    setMode("single");
+    setTopic("");
+    setMultiTopic("");
+    setTasks([]);
+    setActiveTaskIndex(0);
+    setNodes(emptyNodes());
+    setRunStatus("idle");
+    setRunId(null);
+    setReport(null);
+    setSingleCreatedAt(null);
+    setPendingSession(null);
+    setNotice("");
+    setReconnectNotice("");
+    setCopied({});
+    setExpanded({});
+    resetOutlineEditor();
+    window.scrollTo({ top: 0, behavior: "smooth" });
+  }
   // 收藏整个项目要求四路内容都已完成并产出实际内容
   const allFourCompleted = PROJECT_CHANNEL_IDS.every(
     (id) => currentNodes[id]?.status === "completed",
@@ -859,6 +1122,7 @@ export default function Home() {
         setNodes(snap.nodes);
         setRunStatus(snap.status);
         setReport(snap.report);
+        setSingleCreatedAt(snap.createdAt);
         applyOutlineSnapshot(snap);
         setReconnectNotice("");
         if (snap.status !== "running") es.close();
@@ -1152,6 +1416,7 @@ export default function Home() {
       variant: t.variant,
       status: "pending",
       nodes: emptyNodes(),
+      createdAt: Date.now(),
     }));
 
     setTasks(initial);
@@ -1575,6 +1840,7 @@ export default function Home() {
       setRunStatus(snap.status);
       setRunId(snap.runId);
       setReport(snap.report);
+      setSingleCreatedAt(snap.createdAt);
       setExpanded({});
       setCopied({});
       setNotice("");
@@ -1591,7 +1857,6 @@ export default function Home() {
           .filter((name): name is string => Boolean(name)),
         finishedAt: snap.finishedAt,
       });
-      setHistoryOpen(false);
     } catch (err) {
       setNotice(err instanceof Error ? err.message : String(err));
     }
@@ -1610,6 +1875,7 @@ export default function Home() {
     setRunStatus(snap.status);
     setRunId(snap.runId);
     setReport(snap.report);
+    setSingleCreatedAt(snap.createdAt);
     setCopied({});
     setExpanded({});
     setReconnectNotice("");
@@ -1646,6 +1912,7 @@ export default function Home() {
               : "completed",
       nodes: item.snap.nodes,
       runId: item.snap.runId,
+      createdAt: item.snap.createdAt,
       report: item.snap.report,
     }));
 
@@ -1675,7 +1942,6 @@ export default function Home() {
       if (!res.ok) throw new Error("历史快照已不存在");
       const snap = (await res.json()) as RunSnapshot;
       applySnapshotToView(snap);
-      setHistoryOpen(false);
       setNotice(`已接回「${snap.topic}」，可编辑提纲后局部重生成`);
       saveSession("single", [
         { runId: snap.runId, topic: snap.topic, label: "历史续跑" },
@@ -1805,6 +2071,7 @@ export default function Home() {
     setNodes(emptyNodes());
     setRunStatus("idle");
     setReport(null);
+    setSingleCreatedAt(null);
     setCopied({});
     setExpanded({});
     setNotice("");
@@ -2023,6 +2290,169 @@ export default function Home() {
       {/* 3D 氛围背景：最底层装饰，指针事件穿透，不参与任何交互 */}
       <BackgroundScene active={isRunning} />
 
+      <div className="relative flex min-h-screen">
+        {/* 左侧边栏：只承载导航，不参与流水线与 SSE 逻辑 */}
+        <aside
+          className={`sticky top-0 z-30 flex h-screen shrink-0 flex-col border-r border-hairline bg-surface/85 backdrop-blur transition-[width] duration-200 ${
+            sidebarCollapsed ? "w-[68px]" : "w-[264px]"
+          }`}
+        >
+          {/* 顶部：展开态显示项目名，收起态整个徽标就是展开按钮 */}
+          <div
+            className={`flex items-center gap-2 border-b border-hairline py-3 ${
+              sidebarCollapsed ? "justify-center px-2" : "px-3"
+            }`}
+          >
+            <button
+              onClick={() => setSidebarCollapsed((prev) => !prev)}
+              title={sidebarCollapsed ? "展开侧边栏" : "收起侧边栏"}
+              className="grid h-9 w-9 shrink-0 place-items-center rounded-lg bg-accent text-[13px] font-bold text-white transition hover:bg-accent-strong"
+            >
+              CA
+            </button>
+            {!sidebarCollapsed && (
+              <>
+                <p className="min-w-0 flex-1 text-[11px] font-semibold leading-snug text-ink">
+                  面向自媒体场景的多 Agent 协同内容工坊
+                </p>
+                <span className="shrink-0 text-xs text-ink-3" aria-hidden>
+                  «
+                </span>
+              </>
+            )}
+          </div>
+
+          {/* 任务列表：本次会话在前，历史按批次分组在后 */}
+          <div className="flex-1 overflow-y-auto px-2 py-3">
+            {!sidebarCollapsed && (
+              <p className="px-2 pb-2 text-[10px] font-medium tracking-wide text-ink-3">
+                最近任务
+                {sidebarTaskCount > 0 ? ` (${sidebarTaskCount})` : ""}
+              </p>
+            )}
+            <ul className="flex flex-col gap-1">
+              {sidebarCurrent.length > 0 && (
+                <li>
+                  {!sidebarCollapsed && (
+                    <p className="px-2 pb-1 text-[10px] font-medium text-ink-3">
+                      当前视图
+                    </p>
+                  )}
+                  <ul className="flex flex-col gap-1">
+                    {sidebarCurrent.map(renderSidebarTask)}
+                  </ul>
+                </li>
+              )}
+              {sidebarHistoryGroups.map((group) => (
+                <li key={group.key} className="mt-1">
+                  {!sidebarCollapsed && (
+                    <p className="flex items-baseline gap-1.5 px-2 pb-1 text-[10px] text-ink-3">
+                      <span
+                        className="min-w-0 flex-1 truncate"
+                        title={group.title}
+                      >
+                        {group.title}
+                      </span>
+                      <span className="shrink-0 tabular-nums">
+                        {formatTime(group.createdAt)}
+                      </span>
+                    </p>
+                  )}
+                  <ul className="flex flex-col gap-1">
+                    {group.items.map(renderSidebarTask)}
+                  </ul>
+                </li>
+              ))}
+              {sidebarTaskCount === 0 && !sidebarCollapsed && (
+                <li className="px-2 py-3 text-[11px] leading-relaxed text-ink-3">
+                  还没有任务，输入选题开始生成后会出现在这里
+                </li>
+              )}
+            </ul>
+          </div>
+
+          {/* 功能菜单 */}
+          <div className="border-t border-hairline px-2 py-2">
+            <button
+              onClick={handleNewTask}
+              disabled={isRunning}
+              title={
+                isRunning
+                  ? "流水线运行中，结束后才能新建任务"
+                  : "清空当前结果，开始新一轮"
+              }
+              className={`flex w-full items-center gap-2 rounded-lg border border-transparent px-2 py-2 text-xs text-ink-2 transition hover:bg-canvas hover:text-ink disabled:cursor-not-allowed disabled:opacity-40 ${
+                sidebarCollapsed ? "justify-center" : ""
+              }`}
+            >
+              <span className="grid h-6 w-6 shrink-0 place-items-center rounded-md border border-hairline text-[13px] leading-none">
+                ＋
+              </span>
+              {!sidebarCollapsed && <span>新建流水线任务</span>}
+            </button>
+            <button
+              onClick={() => {
+                setStylePanelOpen(true);
+                void loadStyles();
+              }}
+              title="打开风格模板库"
+              className={`mt-1 flex w-full items-center gap-2 rounded-lg border border-transparent px-2 py-2 text-xs text-ink-2 transition hover:bg-canvas hover:text-ink ${
+                sidebarCollapsed ? "justify-center" : ""
+              }`}
+            >
+              <span className="grid h-6 w-6 shrink-0 place-items-center rounded-md border border-hairline text-[11px] leading-none">
+                风
+              </span>
+              {!sidebarCollapsed && <span>风格模板库</span>}
+            </button>
+            <button
+              onClick={() => setSettingsOpen(true)}
+              title="设置"
+              className={`mt-1 flex w-full items-center gap-2 rounded-lg border border-transparent px-2 py-2 text-xs text-ink-2 transition hover:bg-canvas hover:text-ink ${
+                sidebarCollapsed ? "justify-center" : ""
+              }`}
+            >
+              <span className="grid h-6 w-6 shrink-0 place-items-center rounded-md border border-hairline text-[11px] leading-none">
+                设
+              </span>
+              {!sidebarCollapsed && <span>设置</span>}
+            </button>
+          </div>
+
+          {/* 底部：API 连接状态 */}
+          <div
+            className={`border-t border-hairline py-2.5 ${
+              sidebarCollapsed ? "px-2" : "px-3"
+            }`}
+          >
+            <div
+              className={`flex items-center gap-2 text-[10px] text-ink-3 ${
+                sidebarCollapsed ? "justify-center" : ""
+              }`}
+            >
+              <span
+                className={`h-1.5 w-1.5 shrink-0 rounded-full ${
+                  apiOnline === false
+                    ? "bg-red-500"
+                    : apiOnline
+                      ? "bg-emerald-500"
+                      : "bg-neutral-300"
+                }`}
+              />
+              {!sidebarCollapsed && (
+                <span className="truncate">
+                  {apiOnline === null
+                    ? "API 检测中…"
+                    : apiOnline
+                      ? "API 已连接"
+                      : "API 未连接"}
+                </span>
+              )}
+            </div>
+          </div>
+        </aside>
+
+        <div className="flex min-w-0 flex-1 flex-col">
       <header className="sticky top-0 z-20 border-b border-hairline bg-surface/85 backdrop-blur">
         <div className="mx-auto flex w-full max-w-6xl flex-wrap items-center justify-between gap-3 px-6 py-3">
           <div className="flex items-center gap-3">
@@ -2059,16 +2489,6 @@ export default function Home() {
             >
               风格模板
               {customStyleCount > 0 ? ` (${customStyleCount})` : ""}
-            </button>
-            <button
-              onClick={() => {
-                setHistoryOpen((prev) => !prev);
-                if (!historyOpen) void loadHistory();
-              }}
-              className={`${BTN_QUIET} px-3 py-1.5`}
-            >
-              历史记录
-              {historyBatches.length > 0 ? ` (${historyBatches.length})` : ""}
             </button>
             <button
               onClick={() => {
@@ -2131,95 +2551,6 @@ export default function Home() {
           </div>
         </div>
       </section>
-
-      {/* 历史批次列表：按批次聚合，点某个版本进入只读回看 */}
-      {historyOpen && (
-        <section className={`${CARD} flex flex-col gap-3 p-4`}>
-          <div className="flex items-center justify-between">
-            <h2 className="text-sm font-semibold text-ink">最近 5 个批次</h2>
-            <button
-              onClick={() => void loadHistory()}
-              className="text-xs text-ink-3 transition hover:text-ink"
-            >
-              刷新
-            </button>
-          </div>
-          {historyBatches.length === 0 ? (
-            <p className="text-xs text-ink-3">
-              暂无历史任务，跑完一次流水线后会自动保存。
-            </p>
-          ) : (
-            <ul className="flex flex-col gap-2">
-              {historyBatches.map((batch) => (
-                <li
-                  key={batch.batchId}
-                  className="overflow-hidden rounded-lg border border-hairline"
-                >
-                  <div className="flex flex-wrap items-center gap-2 border-b border-hairline bg-canvas/60 px-3 py-2 text-xs">
-                    <span
-                      className="font-medium text-ink"
-                      title={batch.topics.join("\n")}
-                    >
-                      {batch.topics.length > 1
-                        ? `${batch.topics.length} 个选题`
-                        : batch.topics[0]}
-                    </span>
-                    <span className="tabular-nums text-ink-3">
-                      {formatTime(batch.createdAt)}
-                    </span>
-                    <span
-                      className={
-                        batch.status === "completed"
-                          ? "text-emerald-600"
-                          : batch.status === "partial"
-                            ? "text-amber-600"
-                            : "text-red-600"
-                      }
-                    >
-                      {batch.status === "completed"
-                        ? "全部完成"
-                        : batch.status === "partial"
-                          ? "部分失败"
-                          : "全部失败"}
-                    </span>
-                    <span className="text-ink-3">
-                      {batch.runs.length} 个版本
-                    </span>
-                  </div>
-                  <div className="flex flex-wrap gap-2 px-3 py-2">
-                    {batch.runs.map((run) => (
-                      <div key={run.runId} className="flex items-center gap-1">
-                        <button
-                          onClick={() => void openHistoryRun(run)}
-                          className={`max-w-[16rem] truncate rounded-md border px-2.5 py-1 text-xs transition ${
-                            reviewing?.runId === run.runId
-                              ? "border-accent bg-accent text-white"
-                              : "border-hairline-strong bg-surface text-ink-2 hover:border-ink-3 hover:text-ink"
-                          }`}
-                          title={run.topic}
-                        >
-                          {run.variantName ??
-                            (batch.runs.length === 1 ? "单次生成" : run.topic)}
-                          {run.durationMs !== null
-                            ? ` · ${formatDuration(run.durationMs)}`
-                            : ""}
-                        </button>
-                        <button
-                          onClick={() => void resumeHistoryRun(run)}
-                          className="rounded-md border border-hairline-strong px-2 py-1 text-xs text-ink-3 transition hover:border-accent hover:text-accent"
-                          title="接回可编辑视图，改动提纲只重跑受影响的渠道"
-                        >
-                          继续迭代
-                        </button>
-                      </div>
-                    ))}
-                  </div>
-                </li>
-              ))}
-            </ul>
-          )}
-        </section>
-      )}
 
       {/* 成品库：卡片成品库与整批项目库共用一个面板，用标签切换 */}
       {libraryOpen && (
@@ -3636,6 +3967,90 @@ export default function Home() {
           <BatchSummary tasks={tasks} />
         )}
       </main>
+        </div>
+      </div>
+
+      {/* 设置：轻量弹层，只放本地体验相关选项，不触碰历史与成品 */}
+      {settingsOpen && (
+        <div
+          className="fixed inset-0 z-50 grid place-items-center bg-ink/40 px-4"
+          role="dialog"
+          aria-modal="true"
+          aria-label="设置"
+          onClick={() => setSettingsOpen(false)}
+        >
+          <div
+            className="w-full max-w-sm rounded-xl border border-hairline bg-surface p-5 shadow-pop"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <div className="flex items-center justify-between">
+              <h3 className="text-sm font-semibold text-ink">设置</h3>
+              <button
+                onClick={() => setSettingsOpen(false)}
+                className="text-xs text-ink-3 transition hover:text-ink"
+              >
+                关闭
+              </button>
+            </div>
+            <p className="mt-1 text-[11px] leading-relaxed text-ink-3">
+              只放本地体验相关的选项，不影响已保存的历史快照与成品库。
+            </p>
+
+            <div className="mt-4 flex flex-col gap-2">
+              <div className="flex items-center justify-between rounded-lg border border-hairline bg-canvas px-3 py-2">
+                <div>
+                  <p className="text-xs text-ink">侧边栏收起</p>
+                  <p className="mt-0.5 text-[10px] text-ink-3">
+                    只在本次会话生效，刷新后恢复展开
+                  </p>
+                </div>
+                <button
+                  onClick={() => setSidebarCollapsed((prev) => !prev)}
+                  aria-pressed={sidebarCollapsed}
+                  aria-label="切换侧边栏收起"
+                  className={`relative h-5 w-9 shrink-0 rounded-full transition ${
+                    sidebarCollapsed ? "bg-accent" : "bg-neutral-300"
+                  }`}
+                >
+                  <span
+                    className={`absolute top-0.5 h-4 w-4 rounded-full bg-white transition-all ${
+                      sidebarCollapsed ? "left-4" : "left-0.5"
+                    }`}
+                  />
+                </button>
+              </div>
+
+              <button
+                onClick={() => {
+                  setSettingsOpen(false);
+                  setTourStep(1);
+                }}
+                className="flex items-center justify-between rounded-lg border border-hairline bg-canvas px-3 py-2 text-left text-xs text-ink transition hover:border-accent hover:text-accent"
+              >
+                重新查看使用引导
+                <span className="text-ink-3">›</span>
+              </button>
+
+              <button
+                onClick={() => {
+                  try {
+                    window.localStorage.removeItem(SESSION_KEY);
+                  } catch {
+                    // 隐私模式下本来就没有写入，忽略即可
+                  }
+                  setPendingSession(null);
+                  setSettingsOpen(false);
+                  setNotice("已清空本地会话记录，历史快照与成品库不受影响");
+                }}
+                className="flex items-center justify-between rounded-lg border border-hairline bg-canvas px-3 py-2 text-left text-xs text-ink transition hover:border-red-300 hover:text-red-600"
+              >
+                清空本地会话记录
+                <span className="text-ink-3">›</span>
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* 首次进入引导：半透明遮罩挖出目标区域，逐步说明三步 */}
       {tourStep > 0 && (
