@@ -183,8 +183,10 @@ const MODE_TABS: { id: Mode; label: string }[] = [
 const SESSION_KEY = "cab-last-run";
 /** 超过一天的上次任务不再提示，避免开屏被旧数据打扰 */
 const SESSION_TTL = 24 * 60 * 60 * 1000;
-/** 提纲撤销栈上限：只保留最近 20 次失焦变更，超出丢最早的一条 */
+/** 提纲撤销栈上限：只保留最近 20 次变更，超出丢最早的一条 */
 const OUTLINE_HISTORY_LIMIT = 20;
+/** 提纲输入停顿多久记一步：不依赖失焦，撤销按钮随时跟得上 */
+const OUTLINE_AUTOSAVE_MS = 1200;
 /** API 连接状态探测间隔：30 秒内服务端断开能被发现，又不会频繁打扰后端 */
 const API_POLL_MS = 30 * 1000;
 
@@ -546,6 +548,8 @@ export default function Home() {
   const [outlineHistoryState, setOutlineHistoryState] = useState({
     canUndo: false,
     canRedo: false,
+    undoSteps: 0,
+    redoSteps: 0,
   });
   /** 进入编辑时的原始草稿：切任务时据此判断有没有未提交的修改 */
   const outlineBaselineRef = useRef("");
@@ -1065,6 +1069,8 @@ export default function Home() {
     setOutlineHistoryState({
       canUndo: index > 0,
       canRedo: index < entries.length - 1,
+      undoSteps: Math.max(index, 0),
+      redoSteps: Math.max(entries.length - 1 - index, 0),
     });
   }, []);
 
@@ -1130,6 +1136,15 @@ export default function Home() {
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
   }, [outlineEditing, redoOutline, undoOutline]);
+
+  // 输入停顿即记一步：不依赖失焦，避免「撤销」在编辑中一直不可用
+  useEffect(() => {
+    if (!outlineEditing) return;
+    const timer = window.setTimeout(() => {
+      recordOutlineHistory(outlineDraft);
+    }, OUTLINE_AUTOSAVE_MS);
+    return () => window.clearTimeout(timer);
+  }, [outlineEditing, outlineDraft, recordOutlineHistory]);
 
   /** 策划完成时快照里还没有版本链，单独拉一次全量快照补上 */
   const refreshOutline = useCallback(
@@ -1700,6 +1715,28 @@ export default function Home() {
     }
   }
 
+  async function handleCopyAll() {
+    const lf = currentNodes.longform.content.trim();
+    const sc = currentNodes.script.content.trim();
+    const xhs = currentNodes.xhs.content.trim();
+    if (!lf && !sc && !xhs) return;
+    const text = [
+      `# 选题：${currentTopic}`,
+      "## 公众号长文",
+      lf,
+      "## 短视频脚本",
+      sc,
+      "## 小红书笔记",
+      xhs,
+    ].join("\n\n");
+    try {
+      await navigator.clipboard.writeText(text);
+      setNotice("已复制四路产出");
+    } catch {
+      setNotice("复制失败，请手动选择文本复制");
+    }
+  }
+
   function handleDownloadImage() {
     const url = currentNodes.image.imageUrl;
     if (!url) return;
@@ -1973,7 +2010,7 @@ export default function Home() {
   }
 
   // 历史批次「继续迭代」：接回内存后进入可编辑视图，不动原产出
-  async function resumeHistoryRun(entry: HistoryRunEntry) {
+  async function resumeHistoryRun(entry: Pick<HistoryRunEntry, "runId">) {
     if (!beginTaskSwitch()) return;
     try {
       const res = await fetch(`/api/run/${entry.runId}/resume`, {
@@ -2364,12 +2401,30 @@ export default function Home() {
 
           {/* 任务列表：本次会话在前，历史按批次分组在后 */}
           <div className="flex-1 overflow-y-auto px-2 py-3">
+            {sidebarCollapsed && (
+              // 收起态只留计数与运行指示：窄栏里铺一排色点没有信息量
+              <div className="flex flex-col items-center gap-2 py-1">
+                <span
+                  title={`最近任务 ${sidebarTaskCount} 个，展开侧边栏查看`}
+                  className="grid h-8 w-8 place-items-center rounded-lg border border-hairline bg-canvas text-[11px] tabular-nums text-ink-2"
+                >
+                  {sidebarTaskCount}
+                </span>
+                {hasLiveRun && (
+                  <span
+                    title="流水线运行中"
+                    className="h-2 w-2 animate-pulse rounded-full bg-blue-500"
+                  />
+                )}
+              </div>
+            )}
             {!sidebarCollapsed && (
               <p className="px-2 pb-2 text-[10px] font-medium tracking-wide text-ink-3">
                 最近任务
                 {sidebarTaskCount > 0 ? ` (${sidebarTaskCount})` : ""}
               </p>
             )}
+            {!sidebarCollapsed && (
             <ul className="flex flex-col gap-1">
               {sidebarCurrent.length > 0 && (
                 <li>
@@ -2403,12 +2458,13 @@ export default function Home() {
                   </ul>
                 </li>
               ))}
-              {sidebarTaskCount === 0 && !sidebarCollapsed && (
+              {sidebarTaskCount === 0 && (
                 <li className="px-2 py-3 text-[11px] leading-relaxed text-ink-3">
                   还没有任务，输入选题开始生成后会出现在这里
                 </li>
               )}
             </ul>
+            )}
           </div>
 
           {/* 功能菜单 */}
@@ -2480,12 +2536,15 @@ export default function Home() {
                 }`}
               />
               {!sidebarCollapsed && (
-                <span className="truncate">
+                <span
+                  className="truncate"
+                  title="探测的是本地 Next 服务与读写是否正常，不代表模型接口状态"
+                >
                   {apiOnline === null
-                    ? "API 检测中…"
+                    ? "服务检测中…"
                     : apiOnline
-                      ? "API 已连接"
-                      : "API 未连接"}
+                      ? "本地服务正常"
+                      : "本地服务未响应"}
                 </span>
               )}
             </div>
@@ -3003,11 +3062,17 @@ export default function Home() {
             </span>
           )}
           <span className="text-xs text-blue-600">
-            只读快照，没有实时流；重新生成会创建新任务
+            只读快照，没有实时流；继续编辑会基于这条任务改提纲并局部重生成
           </span>
           <button
+            onClick={() => void resumeHistoryRun({ runId: reviewing.runId })}
+            className="ml-auto rounded-md bg-blue-600 px-2.5 py-1 text-xs font-medium text-white transition hover:bg-blue-700"
+          >
+            继续编辑并迭代
+          </button>
+          <button
             onClick={exitReview}
-            className="ml-auto rounded-md border border-blue-300 bg-white px-2.5 py-1 text-xs text-blue-700"
+            className="rounded-md border border-blue-300 bg-white px-2.5 py-1 text-xs text-blue-700"
           >
             退出回看
           </button>
@@ -3103,6 +3168,14 @@ export default function Home() {
                   全部中断
                 </button>
                 <button
+                  onClick={() => void handleCopyAll()}
+                  disabled={!isCompleted}
+                  title="把长文、脚本、小红书三路产出一起复制到剪贴板"
+                  className={BTN_GHOST}
+                >
+                  复制全部
+                </button>
+                <button
                   onClick={handleExportAll}
                   disabled={!isCompleted}
                   className={BTN_GHOST}
@@ -3163,6 +3236,14 @@ export default function Home() {
                   className={BTN_GHOST}
                 >
                   全部中断
+                </button>
+                <button
+                  onClick={() => void handleCopyAll()}
+                  disabled={!isCompleted}
+                  title="把长文、脚本、小红书三路产出一起复制到剪贴板"
+                  className={BTN_GHOST}
+                >
+                  复制全部
                 </button>
                 <button
                   onClick={handleExportAll}
@@ -3274,6 +3355,16 @@ export default function Home() {
             {batchAborted > 0 && (
               <span className="text-amber-600">已中断 {batchAborted}</span>
             )}
+            {batchTotal >= 2 &&
+              batchCompleted === batchTotal &&
+              !compareView && (
+                <button
+                  onClick={() => setCompareView(true)}
+                  className="rounded-md border border-accent px-2 py-0.5 text-accent transition hover:bg-accent hover:text-white"
+                >
+                  查看本批对比
+                </button>
+              )}
           </div>
           <div className="h-1.5 w-full overflow-hidden rounded-full bg-neutral-200">
             <div
@@ -3870,7 +3961,7 @@ export default function Home() {
                             <button
                               onClick={undoOutline}
                               disabled={!outlineHistoryState.canUndo || outlineBusy}
-                              title="回到上一次失焦时的草稿（焦点不在输入框时按 Ctrl/Cmd+Z）"
+                              title="回到上一个记录点（停顿 1.2 秒或失焦时自动记录；焦点不在输入框时也可按 Ctrl/Cmd+Z）"
                               className="rounded-md border border-hairline-strong px-2.5 py-1.5 text-xs text-ink-2 transition hover:border-accent hover:text-accent disabled:cursor-not-allowed disabled:opacity-40"
                             >
                               撤销
@@ -3883,6 +3974,11 @@ export default function Home() {
                             >
                               重做
                             </button>
+                            {outlineHistoryState.undoSteps > 0 && (
+                              <span className="text-[11px] text-ink-3">
+                                可撤销 {outlineHistoryState.undoSteps} 步
+                              </span>
+                            )}
                             {draftParse?.ok && !outlineChanged && (
                               <span className="text-[11px] text-ink-3">
                                 与当前版本一致，修改后才能提交
@@ -4075,6 +4171,13 @@ export default function Home() {
 
               <button
                 onClick={() => {
+                  if (
+                    !window.confirm(
+                      "只清除本机保存的上次会话记录，刷新后不再自动接回；历史快照与成品库不受影响。继续？",
+                    )
+                  ) {
+                    return;
+                  }
                   try {
                     window.localStorage.removeItem(SESSION_KEY);
                   } catch {
@@ -4082,11 +4185,16 @@ export default function Home() {
                   }
                   setPendingSession(null);
                   setSettingsOpen(false);
-                  setNotice("已清空本地会话记录，历史快照与成品库不受影响");
+                  setNotice("已清除刷新恢复记录，历史快照与成品库不受影响");
                 }}
                 className="flex items-center justify-between rounded-lg border border-hairline bg-canvas px-3 py-2 text-left text-xs text-ink transition hover:border-red-300 hover:text-red-600"
               >
-                清空本地会话记录
+                <span className="flex flex-col">
+                  <span>清除刷新恢复记录</span>
+                  <span className="mt-0.5 text-[10px] text-ink-3">
+                    只影响刷新后自动接回，不删历史任务
+                  </span>
+                </span>
                 <span className="text-ink-3">›</span>
               </button>
             </div>
