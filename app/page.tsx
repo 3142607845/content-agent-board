@@ -173,6 +173,45 @@ function parseOutlineText(
 
 type Mode = "single" | "multi-topic" | "multi-version";
 
+/** 策划 Agent 的四个渠道 key，与 lib/outline-diff.ts 的 OUTLINE_CHANNELS 对齐 */
+type OutlineChannelKey = "longForm" | "script" | "xhs" | "image";
+
+/** 提纲文档：已知字段给类型，其余字段原样保留，避免表单编辑丢掉扩展内容 */
+interface OutlineDoc {
+  topic?: string;
+  outline?: Partial<Record<OutlineChannelKey, Record<string, unknown>>>;
+  [key: string]: unknown;
+}
+
+function isOutlineDoc(value: unknown): value is OutlineDoc {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const outline = (value as { outline?: unknown }).outline;
+  return !!outline && typeof outline === "object" && !Array.isArray(outline);
+}
+
+/** 表单里读字符串字段：类型不对就按空串处理，不让脏数据把输入框渲染崩掉 */
+function outlineText(value: unknown): string {
+  return typeof value === "string" ? value : "";
+}
+
+/** 数组字段按每行一条编辑，读写都走这个约定 */
+function outlineLines(value: unknown): string {
+  return Array.isArray(value)
+    ? value.filter((item): item is string => typeof item === "string").join("\n")
+    : "";
+}
+
+function outlineList(text: string): string[] {
+  return text
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean);
+}
+
+/** 表单输入框的统一外观 */
+const OUTLINE_FIELD_CLASS =
+  "w-full rounded-md border border-hairline-strong bg-canvas px-2.5 py-1.5 text-xs text-ink outline-none transition focus:border-accent";
+
 const MODE_TABS: { id: Mode; label: string }[] = [
   { id: "single", label: "单次生成模式" },
   { id: "multi-topic", label: "批量选题模式" },
@@ -536,6 +575,8 @@ export default function Home() {
   >(null);
   const [outlineError, setOutlineError] = useState("");
   const [outlineNotice, setOutlineNotice] = useState("");
+  /** 提纲编辑方式：默认表单，结构无法识别时退回 JSON 让人修 */
+  const [outlineJsonMode, setOutlineJsonMode] = useState(false);
   const [outlineBusy, setOutlineBusy] = useState(false);
   /**
    * 提纲编辑的本地撤销栈：只存草稿文本，纯前端，不落库也不上后端。
@@ -1018,6 +1059,84 @@ export default function Home() {
           draftParse.value,
         )
       : [];
+
+  /** 表单编辑读的就是这份解析结果；结构不认识时为 null，退回 JSON 模式 */
+  const outlineShape =
+    draftParse?.ok === true && isOutlineDoc(draftParse.value)
+      ? draftParse.value
+      : null;
+
+  /** 表单改动的唯一出口：改完重新序列化回草稿文本，撤销栈与提交链路完全不变 */
+  function updateOutline(mutate: (doc: OutlineDoc) => void) {
+    if (draftParse?.ok !== true || !isOutlineDoc(draftParse.value)) return;
+    const doc = JSON.parse(JSON.stringify(draftParse.value)) as OutlineDoc;
+    mutate(doc);
+    setOutlineDraft(JSON.stringify(doc, null, 2));
+  }
+
+  function updateOutlineChannel(
+    channel: OutlineChannelKey,
+    patch: Record<string, unknown>,
+  ) {
+    updateOutline((doc) => {
+      const outline = (doc.outline ??= {});
+      outline[channel] = { ...(outline[channel] ?? {}), ...patch };
+    });
+  }
+
+  /** 渠道表单块：角度 + 若干行文本字段，四个渠道共用同一套结构 */
+  const renderOutlineChannel = (
+    channel: OutlineChannelKey,
+    title: string,
+    fields: { key: string; label: string; lines?: boolean }[],
+  ) => {
+    const data = outlineShape?.outline?.[channel] ?? {};
+    return (
+      <div
+        key={channel}
+        className="flex flex-col gap-2 rounded-lg border border-hairline bg-surface p-3"
+      >
+        <p className="text-xs font-medium text-ink">{title}</p>
+        <label className="flex flex-col gap-1">
+          <span className="text-[10px] text-ink-3">切入角度</span>
+          <input
+            value={outlineText(data.angle)}
+            onChange={(event) =>
+              updateOutlineChannel(channel, { angle: event.target.value })
+            }
+            className={OUTLINE_FIELD_CLASS}
+          />
+        </label>
+        {fields.map((field) => (
+          <label key={field.key} className="flex flex-col gap-1">
+            <span className="text-[10px] text-ink-3">{field.label}</span>
+            {field.lines ? (
+              <textarea
+                rows={3}
+                value={outlineLines(data[field.key])}
+                onChange={(event) =>
+                  updateOutlineChannel(channel, {
+                    [field.key]: outlineList(event.target.value),
+                  })
+                }
+                className={`${OUTLINE_FIELD_CLASS} resize-y leading-relaxed`}
+              />
+            ) : (
+              <input
+                value={outlineText(data[field.key])}
+                onChange={(event) =>
+                  updateOutlineChannel(channel, {
+                    [field.key]: event.target.value,
+                  })
+                }
+                className={OUTLINE_FIELD_CLASS}
+              />
+            )}
+          </label>
+        ))}
+      </div>
+    );
+  };
 
   const patchNodeSingle = useCallback(
     (nodeId: NodeId, patch: Partial<AgentNodeState>) => {
@@ -1602,6 +1721,9 @@ export default function Home() {
       : currentNodes.planner.content.trim();
     setOutlineDraft(text);
     outlineBaselineRef.current = text;
+    // 结构可识别的提纲默认进表单，识别不了先给 JSON 让人修
+    const parsed = parseOutlineText(text);
+    setOutlineJsonMode(!(parsed.ok && isOutlineDoc(parsed.value)));
     // 换版本等于开新会话：旧版本上的编辑历史不应带过来
     seedOutlineHistory(text);
     setOutlineSelectedVersion(target?.id ?? null);
@@ -1616,6 +1738,7 @@ export default function Home() {
     setOutlineDraft("");
     setOutlineSelectedVersion(null);
     setOutlineError("");
+    setOutlineJsonMode(false);
     outlineBaselineRef.current = "";
     clearOutlineHistory();
   }
@@ -1627,6 +1750,7 @@ export default function Home() {
     setOutlineSelectedVersion(null);
     setOutlineError("");
     setOutlineNotice("");
+    setOutlineJsonMode(false);
     outlineBaselineRef.current = "";
     clearOutlineHistory();
   }
@@ -2499,7 +2623,12 @@ export default function Home() {
               <span className="grid h-6 w-6 shrink-0 place-items-center rounded-md border border-hairline text-[11px] leading-none">
                 风
               </span>
-              {!sidebarCollapsed && <span>风格模板库</span>}
+              {!sidebarCollapsed && (
+                <span>
+                  风格模板库
+                  {customStyleCount > 0 ? ` (${customStyleCount})` : ""}
+                </span>
+              )}
             </button>
             <button
               onClick={() => setSettingsOpen(true)}
@@ -3922,17 +4051,81 @@ export default function Home() {
 
                       {outlineEditing ? (
                         <>
-                          <textarea
-                            value={outlineDraft}
-                            onChange={(event) =>
-                              setOutlineDraft(event.target.value)
-                            }
-                            onBlur={() => recordOutlineHistory(outlineDraft)}
-                            rows={16}
-                            spellCheck={false}
-                            className="max-h-96 w-full resize-y overflow-auto rounded-lg border border-hairline-strong bg-canvas p-3 font-mono text-[11px] leading-relaxed text-ink outline-none transition focus:border-accent"
-                          />
-                          {draftParse && !draftParse.ok && (
+                          <div className="flex flex-wrap items-center gap-2">
+                            <span className="text-[11px] text-ink-3">编辑方式</span>
+                            <button
+                              onClick={() => setOutlineJsonMode((prev) => !prev)}
+                              className="rounded-md border border-hairline-strong px-2 py-0.5 text-[11px] text-ink-2 transition hover:border-accent hover:text-accent"
+                            >
+                              {outlineJsonMode ? "改用表单编辑" : "改用 JSON 编辑"}
+                            </button>
+                            {!outlineJsonMode && !outlineShape && (
+                              <span className="text-[11px] text-amber-600">
+                                当前提纲结构无法识别，请先切到 JSON 编辑修复
+                              </span>
+                            )}
+                          </div>
+                          {outlineJsonMode ? (
+                            <textarea
+                              value={outlineDraft}
+                              onChange={(event) =>
+                                setOutlineDraft(event.target.value)
+                              }
+                              onBlur={() => recordOutlineHistory(outlineDraft)}
+                              rows={16}
+                              spellCheck={false}
+                              className="max-h-96 w-full resize-y overflow-auto rounded-lg border border-hairline-strong bg-canvas p-3 font-mono text-[11px] leading-relaxed text-ink outline-none transition focus:border-accent"
+                            />
+                          ) : outlineShape ? (
+                            <div className="flex flex-col gap-3">
+                              <label className="flex flex-col gap-1">
+                                <span className="text-[11px] font-medium text-ink-2">
+                                  选题
+                                </span>
+                                <input
+                                  value={outlineText(outlineShape.topic)}
+                                  onChange={(event) =>
+                                    updateOutline((doc) => {
+                                      doc.topic = event.target.value;
+                                    })
+                                  }
+                                  className={OUTLINE_FIELD_CLASS}
+                                />
+                              </label>
+                              <div className="grid gap-3 md:grid-cols-2">
+                                {renderOutlineChannel("longForm", "公众号长文", [
+                                  {
+                                    key: "structure",
+                                    label: "段落要点（每行一条）",
+                                    lines: true,
+                                  },
+                                ])}
+                                {renderOutlineChannel("script", "短视频脚本", [
+                                  {
+                                    key: "shots",
+                                    label: "分镜（每行一条）",
+                                    lines: true,
+                                  },
+                                ])}
+                                {renderOutlineChannel("xhs", "小红书笔记", [
+                                  { key: "headline", label: "标题" },
+                                  {
+                                    key: "tags",
+                                    label: "标签（每行一个）",
+                                    lines: true,
+                                  },
+                                ])}
+                                {renderOutlineChannel("image", "配图", [
+                                  {
+                                    key: "prompts",
+                                    label: "配图描述词（每行一条）",
+                                    lines: true,
+                                  },
+                                ])}
+                              </div>
+                            </div>
+                          ) : null}
+                          {outlineJsonMode && draftParse && !draftParse.ok && (
                             <p className="text-[11px] text-red-600">
                               JSON 语法错误：{draftParse.error}
                             </p>
