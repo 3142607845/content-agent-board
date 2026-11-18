@@ -25,6 +25,6 @@ export class XhsAgent extends BaseAgent {
   readonly id = "xhs";
   readonly name = "小红书 Agent";
   readonly systemPrompt = SYSTEM_PROMPT;
-  readonly modelId = "glm-5-3-flash-260828";
+  readonly modelId = "deepseek-v4-1-flash-261017";
   readonly temperature = 0.8;
 }

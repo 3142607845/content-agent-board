@@ -72,7 +72,7 @@ ARK_BASE_URL=https://ark.cn-beijing.volces.com/api/v3
 | 策划 Agent | `deepseek-v4-1-flash-261017` | `lib/agents/planner.ts` |
 | 公众号长文 | `deepseek-v4-1-flash-261017` | `lib/agents/longform.ts` |
 | 短视频脚本 | `deepseek-v4-1-flash-261017` | `lib/agents/script.ts` |
-| 小红书文案 | `glm-5-3-flash-260828` | `lib/agents/xhs.ts` |
+| 小红书文案 | `deepseek-v4-1-flash-261017` | `lib/agents/xhs.ts` |
 | 配图提示词扩写 | `doubao-seed-2-1-pro-260915` | `lib/agents/image.ts` |
 | 图片生成 | `doubao-seedream-5-0-flash-260915` | `lib/image.ts` |
 
