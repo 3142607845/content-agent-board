@@ -1,0 +1,12 @@
+node_modules
+.next
+.git
+.gitignore
+.vercel
+data
+public/generated
+.env
+.env.local
+*.log
+README.md
+docs
